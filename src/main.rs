@@ -1,9 +1,9 @@
 use image::{Rgb, RgbImage, RgbaImage};
 use nalgebra::DMatrix;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::{borrow::Cow, num::NonZeroU32, sync::mpsc};
-use wgpu::{Instance, Backends, DeviceDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, VertexBufferLayout, VertexStepMode, PrimitiveState, FragmentState, ColorWrites, ColorTargetState, PipelineLayout, RenderPipelineDescriptor, MultisampleState, TextureFormat, BlendState, PipelineLayoutDescriptor, TextureDescriptor, Extent3d, TextureUsages, TextureDimension
-, Operations, RenderPassColorAttachment, CommandEncoderDescriptor, TextureViewDescriptor, RenderPassDescriptor, BufferDescriptor, BufferUsages, ImageDataLayout, ImageCopyTexture, ImageCopyBuffer, Origin3d, TextureAspect, Maintain, MapMode,
+use std::{borrow::Cow, num::{NonZeroU32, NonZeroU64}, sync::mpsc, io::Write};
+use byteorder::{LittleEndian, WriteBytesExt};
+use wgpu::{Instance, Backends, DeviceDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, VertexBufferLayout, VertexStepMode, PrimitiveState, FragmentState, ColorWrites, ColorTargetState, PipelineLayout, RenderPipelineDescriptor, MultisampleState, TextureFormat, BlendState, PipelineLayoutDescriptor, TextureDescriptor, Extent3d, TextureUsages, TextureDimension, BindGroupEntry, BindingResource, Operations, RenderPassColorAttachment, CommandEncoderDescriptor, TextureViewDescriptor, RenderPassDescriptor, BufferDescriptor, BufferUsages, ImageDataLayout, ImageCopyTexture, ImageCopyBuffer, Origin3d, TextureAspect, Maintain, MapMode, util::{DeviceExt, BufferInitDescriptor}, BindGroupDescriptor, BindGroupLayoutEntry, BindGroupLayoutDescriptor, BindingType, BufferBindingType, ShaderStages
 };
 
 const SIZE: u32 = 512;
@@ -52,7 +52,7 @@ fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
     imgs
 }
 
-async fn sample_gpu(weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
+async fn sample_gpu(dims: &[usize], weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
     let instance = Instance::new(Backends::PRIMARY);
     let adapter = instance.enumerate_adapters(Backends::PRIMARY).next().unwrap();
     println!("{:?}", adapter.get_info());
@@ -62,7 +62,50 @@ async fn sample_gpu(weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn 
         label: None,
         source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
     });
-    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor::default());
+    let matrices_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(4*4 + 4),
+                },
+                count: None,
+            }
+        ],
+    });
+    let mut matrices_buffer_contents = Vec::new();
+    for dim in dims.iter() {
+        matrices_buffer_contents.write_u32::<LittleEndian>(*dim as u32)?;
+    }
+    for w in weights.iter() {
+        for row in w.row_iter() {
+            for x in row.iter() {
+                matrices_buffer_contents.write(&(*x as f32).to_le_bytes())?;
+            }
+        }
+    }
+    let matrices_buffer = device.create_buffer_init(&BufferInitDescriptor {
+        label: None,
+        contents: &matrices_buffer_contents,
+        usage: BufferUsages::STORAGE,
+    });
+    let matrices_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: None,
+        layout: &matrices_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[&matrices_bind_group_layout],
+        push_constant_ranges: &[],
+    });
     let vertex_layout = VertexBufferLayout {
         array_stride: 0,
         step_mode: VertexStepMode::Vertex,
@@ -129,6 +172,7 @@ async fn sample_gpu(weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn 
             depth_stencil_attachment: None,
         });
         render_pass.set_pipeline(&pipeline);
+        render_pass.set_bind_group(0, &matrices_bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         render_pass.draw(0..6, 0..1);
         drop(render_pass);
@@ -173,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for seed in 0..3 {
         let weights = gen_weights(seed, &dims);
         //let imgs = sample(&weights);
-        let imgs = futures_executor::block_on(sample_gpu(&weights))?;
+        let imgs = futures_executor::block_on(sample_gpu(&dims, &weights))?;
         println!("imgs.len: {}", imgs.len());
         for (i, img) in imgs.iter().enumerate() {
             img.save(&format!("tmp{:02}_{:02}.png", seed, i))?;

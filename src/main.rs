@@ -3,11 +3,11 @@ use nalgebra::DMatrix;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{borrow::Cow, num::{NonZeroU32, NonZeroU64}, sync::mpsc, io::Write};
 use byteorder::{LittleEndian, WriteBytesExt};
-use wgpu::{Instance, Backends, DeviceDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, VertexBufferLayout, VertexStepMode, PrimitiveState, FragmentState, ColorWrites, ColorTargetState, PipelineLayout, RenderPipelineDescriptor, MultisampleState, TextureFormat, BlendState, PipelineLayoutDescriptor, TextureDescriptor, Extent3d, TextureUsages, TextureDimension, BindGroupEntry, BindingResource, Operations, RenderPassColorAttachment, CommandEncoderDescriptor, TextureViewDescriptor, RenderPassDescriptor, BufferDescriptor, BufferUsages, ImageDataLayout, ImageCopyTexture, ImageCopyBuffer, Origin3d, TextureAspect, Maintain, MapMode, util::{DeviceExt, BufferInitDescriptor}, BindGroupDescriptor, BindGroupLayoutEntry, BindGroupLayoutDescriptor, BindingType, BufferBindingType, ShaderStages
+use wgpu::{Instance, Backends, DeviceDescriptor, ShaderModuleDescriptor, ShaderSource, VertexState, VertexBufferLayout, VertexStepMode, PrimitiveState, FragmentState, ColorWrites, ColorTargetState, PipelineLayout, RenderPipelineDescriptor, MultisampleState, TextureFormat, BlendState, PipelineLayoutDescriptor, TextureDescriptor, Extent3d, TextureUsages, TextureDimension, BindGroupEntry, BindingResource, Operations, RenderPassColorAttachment, CommandEncoderDescriptor, TextureViewDescriptor, RenderPassDescriptor, BufferDescriptor, BufferUsages, ImageDataLayout, ImageCopyTexture, ImageCopyBuffer, Origin3d, TextureAspect, Maintain, MapMode, util::{DeviceExt, BufferInitDescriptor}, BindGroupDescriptor, BindGroupLayoutEntry, BindGroupLayoutDescriptor, BindingType, BufferBindingType, ShaderStages, BindGroupLayout, Buffer, Texture, TextureView, Adapter, Queue, Device, RenderPipeline
 };
 
 const SIZE: u32 = 512;
-const FRAMES: usize = 100;
+const FRAMES: usize = 1;
 
 fn gen_weights(seed: u64, dims: &[usize]) -> Vec<DMatrix<f64>> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -52,31 +52,120 @@ fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
     imgs
 }
 
-async fn sample_gpu(dims: &[usize], weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
-    let instance = Instance::new(Backends::PRIMARY);
-    let adapter = instance.enumerate_adapters(Backends::PRIMARY).next().unwrap();
-    println!("{:?}", adapter.get_info());
-    let (device, queue) = adapter.request_device(&DeviceDescriptor::default(), None).await?;
-    println!("{:?}", device);
-    let shaders = device.create_shader_module(ShaderModuleDescriptor {
-        label: None,
-        source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
-    });
-    let matrices_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::VERTEX_FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(4*4 + 4),
-                },
-                count: None,
-            }
-        ],
-    });
+struct GPUContext {
+    instance: Instance,
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+    pipeline: RenderPipeline,
+    vertex_buffer: Buffer,
+    size_extent: Extent3d,
+    texture: Texture,
+    texture_view: TextureView,
+    texture_buffer: Buffer,
+    matrices_bind_group_layout: BindGroupLayout,
+}
+
+impl GPUContext {
+    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let instance = Instance::new(Backends::PRIMARY);
+        let adapter = instance.enumerate_adapters(Backends::PRIMARY).next().unwrap();
+        println!("{:?}", adapter.get_info());
+        let (device, queue) = adapter.request_device(&DeviceDescriptor::default(), None).await?;
+        println!("{:?}", device);
+        let shaders = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
+        });
+        let matrices_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX_FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(4*4 + 4),
+                    },
+                    count: None,
+                }
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&matrices_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let vertex_layout = VertexBufferLayout {
+            array_stride: 0,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &[],
+        };
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shaders,
+                entry_point: &"vert_main",
+                buffers: &[vertex_layout],
+            },
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            fragment: Some(FragmentState {
+                module: &shaders,
+                entry_point: &"frag_main",
+                targets: &[
+                    Some(ColorTargetState {
+                        format: TextureFormat::Rgba8Unorm,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })
+                ],
+            }),
+            multiview: None,
+        });
+        let vertex_buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 0,
+            usage: BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let texture_buffer = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: (4 * SIZE * SIZE) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let size_extent = Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1, };
+        let texture = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: size_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        });
+        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            pipeline,
+            vertex_buffer,
+            size_extent,
+            texture,
+            texture_view,
+            texture_buffer,
+            matrices_bind_group_layout,
+        })
+    }
+}
+
+fn sample_gpu(ctxt: &GPUContext, dims: &[usize], weights: &[DMatrix<f64>]) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
     let mut matrices_buffer_contents = Vec::new();
     for dim in dims.iter() {
         matrices_buffer_contents.write_u32::<LittleEndian>(*dim as u32)?;
@@ -88,121 +177,65 @@ async fn sample_gpu(dims: &[usize], weights: &[DMatrix<f64>]) -> Result<Vec<Rgba
             }
         }
     }
-    let matrices_buffer = device.create_buffer_init(&BufferInitDescriptor {
+    let matrices_buffer = ctxt.device.create_buffer_init(&BufferInitDescriptor {
         label: None,
         contents: &matrices_buffer_contents,
         usage: BufferUsages::STORAGE,
     });
-    let matrices_bind_group = device.create_bind_group(&BindGroupDescriptor {
+    let matrices_bind_group = ctxt.device.create_bind_group(&BindGroupDescriptor {
         label: None,
-        layout: &matrices_bind_group_layout,
+        layout: &ctxt.matrices_bind_group_layout,
         entries: &[BindGroupEntry {
             binding: 0,
             resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
         }],
     });
-    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&matrices_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-    let vertex_layout = VertexBufferLayout {
-        array_stride: 0,
-        step_mode: VertexStepMode::Vertex,
-        attributes: &[],
-    };
-    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        vertex: VertexState {
-            module: &shaders,
-            entry_point: &"vert_main",
-            buffers: &[vertex_layout],
-        },
-        primitive: PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: MultisampleState::default(),
-        fragment: Some(FragmentState {
-            module: &shaders,
-            entry_point: &"frag_main",
-            targets: &[
-                Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })
-            ],
-        }),
-        multiview: None,
-    });
-    let vertex_buffer = device.create_buffer(&BufferDescriptor {
-        label: None,
-        size: 0,
-        usage: BufferUsages::VERTEX,
-        mapped_at_creation: false,
-    });
-    let texture_buffer = device.create_buffer(&BufferDescriptor {
-        label: None,
-        size: (4 * SIZE * SIZE) as u64,
-        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let size_extent = Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1, };
-    let texture = device.create_texture(&TextureDescriptor {
-        label: None,
-        size: size_extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-    });
-    let texture_view = texture.create_view(&TextureViewDescriptor::default());
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    let mut encoder = ctxt.device.create_command_encoder(&CommandEncoderDescriptor::default());
     {
         let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
             label: None,
             color_attachments: &[
                 Some(RenderPassColorAttachment {
-                    view: &texture_view,
+                    view: &ctxt.texture_view,
                     resolve_target: None,
                     ops: Operations::default(),
                 }),
             ],
             depth_stencil_attachment: None,
         });
-        render_pass.set_pipeline(&pipeline);
+        render_pass.set_pipeline(&ctxt.pipeline);
         render_pass.set_bind_group(0, &matrices_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(0, ctxt.vertex_buffer.slice(..));
         render_pass.draw(0..6, 0..1);
         drop(render_pass);
         encoder.copy_texture_to_buffer(
             ImageCopyTexture {
-                texture: &texture,
+                texture: &ctxt.texture,
                 mip_level: 0,
                 origin: Origin3d::ZERO,
                 aspect: TextureAspect::All,
             },
             ImageCopyBuffer {
-                buffer: &texture_buffer, 
+                buffer: &ctxt.texture_buffer, 
                 layout: ImageDataLayout {
                     offset: 0,
                     bytes_per_row: NonZeroU32::new(4 * SIZE),
                     rows_per_image: NonZeroU32::new(SIZE),
                 },
             },
-            size_extent
+            ctxt.size_extent
         );
     }
-    let submission = queue.submit([encoder.finish()]);
+    let submission = ctxt.queue.submit([encoder.finish()]);
     let (img_tx, img_rx) = mpsc::channel();
-    texture_buffer.slice(..).map_async(MapMode::Read, move |_| {
+    ctxt.texture_buffer.slice(..).map_async(MapMode::Read, move |_| {
         let _ = img_tx.send(());
     });
-    while !device.poll(Maintain::WaitForSubmissionIndex(submission)) {}
+    while !ctxt.device.poll(Maintain::WaitForSubmissionIndex(submission)) {}
     let mut images = Vec::new();
     while let Ok(()) = img_rx.recv() {
-        let image_bytes = Vec::from_iter(texture_buffer.slice(..).get_mapped_range().iter().copied());
+        let image_bytes = Vec::from_iter(ctxt.texture_buffer.slice(..).get_mapped_range().iter().copied());
+        ctxt.texture_buffer.unmap();
         println!("{:?}", &image_bytes[0..50]);
         let image = RgbaImage::from_raw(SIZE, SIZE, image_bytes).unwrap();
         images.push(image);
@@ -214,13 +247,17 @@ async fn sample_gpu(dims: &[usize], weights: &[DMatrix<f64>]) -> Result<Vec<Rgba
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dims = vec![11, 10, 10, 3];
 
+    let ctx = futures_executor::block_on(GPUContext::new())?;
     for seed in 0..3 {
         let weights = gen_weights(seed, &dims);
-        //let imgs = sample(&weights);
-        let imgs = futures_executor::block_on(sample_gpu(&dims, &weights))?;
+        let imgs = sample(&weights);
+        for (i, img) in imgs.iter().enumerate() {
+            img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
+        }
+        let imgs = sample_gpu(&ctx, &dims, &weights)?;
         println!("imgs.len: {}", imgs.len());
         for (i, img) in imgs.iter().enumerate() {
-            img.save(&format!("tmp{:02}_{:02}.png", seed, i))?;
+            img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
         }
     }
     Ok(())

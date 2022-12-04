@@ -4,6 +4,7 @@ struct Matrices {
 }
 
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
+//@group(1) @binding(0) var<uniform> time: f32;
 
 @vertex
 fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {

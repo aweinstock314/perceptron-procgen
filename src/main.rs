@@ -7,6 +7,7 @@ use std::{
     io::Write,
     num::{NonZeroU32, NonZeroU64},
     sync::mpsc,
+    time::Instant,
 };
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -351,14 +352,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for seed in 0..3 {
         let weights = gen_weights(seed, &dims);
         if false {
+            let pre = Instant::now();
             let imgs = sample(&weights);
-            println!("imgs.len: {}", imgs.len());
+            let post = Instant::now();
+            let duration = post.duration_since(pre);
+            println!(
+                "{} images in {} seconds",
+                imgs.len(),
+                duration.as_secs_f32()
+            );
             for (i, img) in imgs.iter().enumerate() {
                 img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
             }
         } else {
+            let pre = Instant::now();
             let imgs = sample_gpu(&ctx, &dims, &weights)?;
-            println!("imgs.len: {}", imgs.len());
+            let post = Instant::now();
+            let duration = post.duration_since(pre);
+            println!(
+                "{} images in {} seconds",
+                imgs.len(),
+                duration.as_secs_f32()
+            );
             for (i, img) in imgs.iter().enumerate() {
                 img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
             }

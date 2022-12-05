@@ -7,7 +7,8 @@ use wgpu::{Instance, Backends, DeviceDescriptor, ShaderModuleDescriptor, ShaderS
 };
 
 const SIZE: u32 = 512;
-const FRAMES: usize = 1;
+const FRAMES: usize = 1000;
+const FRAMES_UNIT: usize = 100;
 
 fn gen_weights(seed: u64, dims: &[usize]) -> Vec<DMatrix<f64>> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -30,7 +31,7 @@ fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
             for xi in 0..SIZE {
                 let x = 8.0 * ((xi as f64 - (SIZE / 2) as f64)) / SIZE as f64;
                 let y = 8.0 * ((yi as f64 - (SIZE / 2) as f64)) / SIZE as f64;
-                let t = 10.0 * ti as f64 / FRAMES as f64;
+                let t = 10.0 * ti as f64 / FRAMES_UNIT as f64;
                 let mut tmp = DMatrix::from_iterator(1, 11, [t, 1.0, x, y, x*x, x*y, y*y, x*x*x, x*x*y, x*y*y, y*y*y].into_iter());
                 for w in weights.iter() {
                     tmp *= w;
@@ -47,7 +48,7 @@ fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
             }
         }
         imgs.push(img);
-        println!("frame {}", ti);
+        //println!("frame {}", ti);
     }
     imgs
 }
@@ -64,6 +65,7 @@ struct GPUContext {
     texture_view: TextureView,
     texture_buffer: Buffer,
     matrices_bind_group_layout: BindGroupLayout,
+    scalar_bind_group_layout: BindGroupLayout,
 }
 
 impl GPUContext {
@@ -92,9 +94,24 @@ impl GPUContext {
                 }
             ],
         });
+        let scalar_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX_FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(4),
+                    },
+                    count: None,
+                }
+            ],
+        });
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&matrices_bind_group_layout],
+            bind_group_layouts: &[&matrices_bind_group_layout, &scalar_bind_group_layout],
             push_constant_ranges: &[],
         });
         let vertex_layout = VertexBufferLayout {
@@ -161,6 +178,7 @@ impl GPUContext {
             texture_view,
             texture_buffer,
             matrices_bind_group_layout,
+            scalar_bind_group_layout,
         })
     }
 }
@@ -190,55 +208,74 @@ fn sample_gpu(ctxt: &GPUContext, dims: &[usize], weights: &[DMatrix<f64>]) -> Re
             resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
         }],
     });
-    let mut encoder = ctxt.device.create_command_encoder(&CommandEncoderDescriptor::default());
-    {
-        let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: None,
-            color_attachments: &[
-                Some(RenderPassColorAttachment {
-                    view: &ctxt.texture_view,
-                    resolve_target: None,
-                    ops: Operations::default(),
-                }),
-            ],
-            depth_stencil_attachment: None,
-        });
-        render_pass.set_pipeline(&ctxt.pipeline);
-        render_pass.set_bind_group(0, &matrices_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, ctxt.vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..1);
-        drop(render_pass);
-        encoder.copy_texture_to_buffer(
-            ImageCopyTexture {
-                texture: &ctxt.texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            ImageCopyBuffer {
-                buffer: &ctxt.texture_buffer, 
-                layout: ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: NonZeroU32::new(4 * SIZE),
-                    rows_per_image: NonZeroU32::new(SIZE),
-                },
-            },
-            ctxt.size_extent
-        );
-    }
-    let submission = ctxt.queue.submit([encoder.finish()]);
-    let (img_tx, img_rx) = mpsc::channel();
-    ctxt.texture_buffer.slice(..).map_async(MapMode::Read, move |_| {
-        let _ = img_tx.send(());
-    });
-    while !ctxt.device.poll(Maintain::WaitForSubmissionIndex(submission)) {}
     let mut images = Vec::new();
-    while let Ok(()) = img_rx.recv() {
-        let image_bytes = Vec::from_iter(ctxt.texture_buffer.slice(..).get_mapped_range().iter().copied());
-        ctxt.texture_buffer.unmap();
-        println!("{:?}", &image_bytes[0..50]);
-        let image = RgbaImage::from_raw(SIZE, SIZE, image_bytes).unwrap();
-        images.push(image);
+    for ti in 0..FRAMES {
+        let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
+        let mut scalar_buffer_contents = Vec::new();
+        scalar_buffer_contents.write(&t.to_le_bytes())?;
+        let scalar_buffer = ctxt.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: &scalar_buffer_contents,
+            usage: BufferUsages::UNIFORM,
+        });
+        let scalar_bind_group = ctxt.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &ctxt.scalar_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(scalar_buffer.as_entire_buffer_binding()),
+            }],
+        });
+        let mut encoder = ctxt.device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: None,
+                color_attachments: &[
+                    Some(RenderPassColorAttachment {
+                        view: &ctxt.texture_view,
+                        resolve_target: None,
+                        ops: Operations::default(),
+                    }),
+                ],
+                depth_stencil_attachment: None,
+            });
+            render_pass.set_pipeline(&ctxt.pipeline);
+            render_pass.set_bind_group(0, &matrices_bind_group, &[]);
+            render_pass.set_bind_group(1, &scalar_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, ctxt.vertex_buffer.slice(..));
+            render_pass.draw(0..6, 0..1);
+            drop(render_pass);
+            encoder.copy_texture_to_buffer(
+                ImageCopyTexture {
+                    texture: &ctxt.texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                ImageCopyBuffer {
+                    buffer: &ctxt.texture_buffer, 
+                    layout: ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: NonZeroU32::new(4 * SIZE),
+                        rows_per_image: NonZeroU32::new(SIZE),
+                    },
+                },
+                ctxt.size_extent
+            );
+        }
+        let submission = ctxt.queue.submit([encoder.finish()]);
+        let (img_tx, img_rx) = mpsc::channel();
+        ctxt.texture_buffer.slice(..).map_async(MapMode::Read, move |_| {
+            let _ = img_tx.send(());
+        });
+        while !ctxt.device.poll(Maintain::WaitForSubmissionIndex(submission)) {}
+        while let Ok(()) = img_rx.recv() {
+            let image_bytes = Vec::from_iter(ctxt.texture_buffer.slice(..).get_mapped_range().iter().copied());
+            ctxt.texture_buffer.unmap();
+            let image = RgbaImage::from_raw(SIZE, SIZE, image_bytes).unwrap();
+            images.push(image);
+        }
+        scalar_buffer.destroy();
     }
 
     Ok(images)
@@ -250,14 +287,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = futures_executor::block_on(GPUContext::new())?;
     for seed in 0..3 {
         let weights = gen_weights(seed, &dims);
-        let imgs = sample(&weights);
-        for (i, img) in imgs.iter().enumerate() {
-            img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
-        }
-        let imgs = sample_gpu(&ctx, &dims, &weights)?;
-        println!("imgs.len: {}", imgs.len());
-        for (i, img) in imgs.iter().enumerate() {
-            img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
+        if false {
+            let imgs = sample(&weights);
+            println!("imgs.len: {}", imgs.len());
+            for (i, img) in imgs.iter().enumerate() {
+                img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
+            }
+        } else {
+            let imgs = sample_gpu(&ctx, &dims, &weights)?;
+            println!("imgs.len: {}", imgs.len());
+            for (i, img) in imgs.iter().enumerate() {
+                img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
+            }
         }
     }
     Ok(())

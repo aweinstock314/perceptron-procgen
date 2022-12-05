@@ -4,7 +4,7 @@ struct Matrices {
 }
 
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
-//@group(1) @binding(0) var<uniform> time: f32;
+@group(1) @binding(0) var<uniform> time: f32;
 
 @vertex
 fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
@@ -46,7 +46,7 @@ fn do_mm(x: array<f32, 16>, m: u32, n: u32, offset: u32) -> array<f32, 16> {
 fn frag_main(@builtin(position) position: vec4<f32>, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     var u: f32 = 8.0 * ((position.x / 512.0) - 0.5);
     var v: f32 = 8.0 * ((position.y / 512.0) - 0.5);
-    var tmp: array<f32, 16> = array<f32, 16>(0.0, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var tmp: array<f32, 16> = array<f32, 16>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
     var offset: u32 = 0u;
     for(var matrix_index: u32 = 0u; matrix_index < 3u; matrix_index++) {
         var m: u32 = matrices.dims[matrix_index];

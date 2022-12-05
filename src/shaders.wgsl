@@ -18,12 +18,6 @@ fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec
     }
 }
 
-fn logistic(x: f32) -> f32 {
-    var epx: f32 = exp(x);
-    var emx: f32 = exp(-x);
-    return (epx - emx) / (epx + emx);
-}
-
 fn do_mm(x: array<f32, 16>, m: u32, n: u32, offset: u32) -> array<f32, 16> {
     // x is m by 1
     // weights is m by n
@@ -37,7 +31,7 @@ fn do_mm(x: array<f32, 16>, m: u32, n: u32, offset: u32) -> array<f32, 16> {
         }
     }
     for(var k: u32 = 0u; k < 16u; k++) {
-        out[k] = logistic(out[k]);
+        out[k] = tanh(out[k]);
     }
     return out;
 }

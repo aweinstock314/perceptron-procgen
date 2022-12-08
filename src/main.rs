@@ -1,4 +1,5 @@
 use byteorder::{LittleEndian, WriteBytesExt};
+use clap::{Arg, Command};
 use image::{Rgb, RgbImage, RgbaImage};
 use nalgebra::DMatrix;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -117,7 +118,7 @@ struct ForwardPass {
 }
 
 impl GPUContext {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    async fn new(dims: &[usize]) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = Instance::new(Backends::PRIMARY);
         let adapter = instance
             .enumerate_adapters(Backends::PRIMARY)
@@ -141,7 +142,7 @@ impl GPUContext {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(4 * 4 + 4),
+                        min_binding_size: NonZeroU64::new(4 * dims.len() as u64 + 4),
                     },
                     count: None,
                 }],
@@ -365,40 +366,71 @@ fn sample_gpu(
     Ok(images)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dims = vec![11, 10, 10, 3];
+enum Backend {
+    Cpu,
+    Gpu,
+}
 
-    let ctx = futures_executor::block_on(GPUContext::new())?;
-    let pass = ForwardPass::new(&ctx);
-    for seed in 0..3 {
-        let weights = gen_weights(seed, &dims);
-        if false {
-            let pre = Instant::now();
-            let imgs = sample(&weights);
-            let post = Instant::now();
-            let duration = post.duration_since(pre);
-            println!(
-                "{} images in {} seconds",
-                imgs.len(),
-                duration.as_secs_f32()
-            );
-            for (i, img) in imgs.iter().enumerate() {
-                img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
-            }
-        } else {
-            let pre = Instant::now();
-            let imgs = sample_gpu(&ctx, &pass, &dims, &weights)?;
-            let post = Instant::now();
-            let duration = post.duration_since(pre);
-            println!(
-                "{} images in {} seconds",
-                imgs.len(),
-                duration.as_secs_f32()
-            );
-            for (i, img) in imgs.iter().enumerate() {
-                img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new("perceptron-procgen")
+        .arg(Arg::new("backend").short('b').value_parser(["cpu", "gpu"]).default_value("gpu").global(true))
+        .arg(Arg::new("dimensions").short('d').default_value("[11, 10, 10, 3]").global(true))
+        .subcommand(Command::new("forward")) ;
+    let command_help = command.render_help();
+    let matches = command.get_matches();
+    let backend = match matches.get_one::<String>("backend").map(|x| &**x) {
+        Some("cpu") => Backend::Cpu,
+        Some("gpu") => Backend::Gpu,
+        _ => {
+            return Ok(());
+        }
+    };
+    let dims = serde_json::from_str::<Vec<usize>>(&**matches.get_one::<String>("dimensions").unwrap())?;
+
+    match matches.subcommand() {
+        Some(("forward", matches)) => {
+            //let dims = vec![11, 10, 10, 3];
+
+            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
+            let pass = ForwardPass::new(&ctx);
+            for seed in 0..3 {
+                let weights = gen_weights(seed, &dims);
+                match backend {
+                    Backend::Cpu => {
+                        let pre = Instant::now();
+                        let imgs = sample(&weights);
+                        let post = Instant::now();
+                        let duration = post.duration_since(pre);
+                        println!(
+                            "{} images in {} seconds",
+                            imgs.len(),
+                            duration.as_secs_f32()
+                        );
+                        for (i, img) in imgs.iter().enumerate() {
+                            img.save(&format!("cpu{:02}_{:02}.png", seed, i))?;
+                        }
+                    }
+                    Backend::Gpu => {
+                        let pre = Instant::now();
+                        let imgs = sample_gpu(&ctx, &pass, &dims, &weights)?;
+                        let post = Instant::now();
+                        let duration = post.duration_since(pre);
+                        println!(
+                            "{} images in {} seconds",
+                            imgs.len(),
+                            duration.as_secs_f32()
+                        );
+                        for (i, img) in imgs.iter().enumerate() {
+                            img.save(&format!("gpu{:02}_{:02}.png", seed, i))?;
+                        }
+                    }
+                }
             }
         }
+        _ => {
+            println!("{}", command_help);
+        }
     }
+
     Ok(())
 }

@@ -1,7 +1,7 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use clap::{Arg, Command};
 use image::{ImageFormat, Rgb, RgbImage, RgbaImage};
-use nalgebra::DMatrix;
+use nalgebra::{DMatrix, Dynamic, VecStorage};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     borrow::Cow,
@@ -450,7 +450,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .subcommand(Command::new("forward"))
         .subcommand(
-            Command::new("backward").arg(Arg::new("target_image").short('t').required(true)),
+            Command::new("backward")
+                .arg(Arg::new("target_image").short('t').required(true))
+                .arg(Arg::new("weights").short('w')),
         );
     let command_help = command.render_help();
     let matches = command.get_matches();
@@ -503,7 +505,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(("backward", matches)) => {
-            let mut weights = gen_weights(0, &dims);
+            let mut weights = if let Some(weights_json) = matches.get_one::<String>("weights") {
+                let data = serde_json::from_str::<Vec<Vec<f64>>>(&weights_json)?;
+                let mut weights = Vec::new();
+                for (k, (i, j)) in dims.iter().zip(dims[1..].iter()).enumerate() {
+                    let storage =
+                        VecStorage::new(Dynamic::new(*i), Dynamic::new(*j), data[k].clone());
+                    let w = DMatrix::from_vec_storage(storage);
+                    weights.push(w);
+                }
+                weights
+            } else {
+                gen_weights(0, &dims)
+            };
             let target_image_path =
                 PathBuf::from(matches.get_one::<String>("target_image").unwrap());
             let file = File::open(&target_image_path)?;
@@ -513,13 +527,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let target_image = target_image.to_rgb8();
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
             let pass = ForwardPass::new(&ctx);
-            for i in 0..100 {
+            for i in 0..500 {
                 let pre = Instant::now();
                 backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
                 let post = Instant::now();
                 let duration = post.duration_since(pre);
                 println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
-                println!("{:?}", weights);
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &weights
+                            .iter()
+                            .map(|w| w.data.as_vec().clone())
+                            .collect::<Vec<Vec<f64>>>()
+                    )?
+                );
                 let imgs = sample_gpu(&ctx, &pass, &dims, &weights, 1)?;
                 imgs[0].save(&format!("backprop_{:02}.png", i))?;
             }

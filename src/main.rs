@@ -1,12 +1,14 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use clap::{Arg, Command};
-use image::{Rgb, RgbImage, RgbaImage};
+use image::{ImageFormat, Rgb, RgbImage, RgbaImage};
 use nalgebra::DMatrix;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     borrow::Cow,
-    io::Write,
+    fs::File,
+    io::{BufReader, Write},
     num::{NonZeroU32, NonZeroU64},
+    path::PathBuf,
     sync::mpsc,
     time::Instant,
 };
@@ -43,9 +45,9 @@ fn gen_weights(seed: u64, dims: &[usize]) -> Vec<DMatrix<f64>> {
     weights
 }
 
-fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
+fn sample(weights: &[DMatrix<f64>], frames: usize) -> Vec<RgbImage> {
     let mut imgs = Vec::new();
-    for ti in 0..FRAMES {
+    for ti in 0..frames {
         let mut img = RgbImage::new(SIZE, SIZE);
         for yi in 0..SIZE {
             for xi in 0..SIZE {
@@ -96,6 +98,65 @@ fn sample(weights: &[DMatrix<f64>]) -> Vec<RgbImage> {
         //println!("frame {}", ti);
     }
     imgs
+}
+
+fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbImage) {
+    for yi in 0..SIZE {
+        for xi in 0..SIZE {
+            let x = 8.0 * (xi as f64 - (SIZE / 2) as f64) / SIZE as f64;
+            let y = 8.0 * (yi as f64 - (SIZE / 2) as f64) / SIZE as f64;
+            let mut intermediates = Vec::new();
+            let mut fw = DMatrix::from_iterator(
+                1,
+                11,
+                [
+                    t,
+                    1.0,
+                    x,
+                    y,
+                    x * x,
+                    x * y,
+                    y * y,
+                    x * x * x,
+                    x * x * y,
+                    x * y * y,
+                    y * y * y,
+                ]
+                .into_iter(),
+            );
+            intermediates.push(fw.clone());
+            for w in weights.iter() {
+                fw *= w;
+                intermediates.push(fw.clone());
+                for v in fw.iter_mut() {
+                    *v = v.tanh();
+                }
+            }
+            //println!("{:?}", intermediates);
+            let target_pixel = target.get_pixel(xi, yi);
+            let target_vector = DMatrix::from_iterator(
+                1,
+                3,
+                [
+                    target_pixel.0[0] as f64 / 255.0,
+                    target_pixel.0[1] as f64 / 255.0,
+                    target_pixel.0[2] as f64 / 255.0,
+                ],
+            );
+            //println!("{:?}", target_vector);
+            let mut bk = fw - target_vector;
+            for (fw, w) in intermediates.iter().zip(weights.iter_mut()).rev() {
+                let fw_activated = fw.map(|v| v.tanh());
+                let fw_prime = fw.map(|v| 1.0 - v.tanh().powf(2.0));
+                //println!("{:?} {:?} {:?}", w.shape(), bk.shape(), fw.shape());
+                let w_prime = bk.clone().transpose() * fw_activated;
+                //println!("{:?} {:?} {:?}", w.shape(), bk.shape(), fw.shape());
+                bk = fw_prime.zip_map(&(bk * w.transpose()), |a, b| a * b);
+                //println!("w_prime: {:?} {:?}", w_prime.shape(), w_prime);
+                w.zip_apply(&w_prime.transpose(), |a, b| *a -= alpha * b);
+            }
+        }
+    }
 }
 
 struct GPUContext {
@@ -257,6 +318,7 @@ fn sample_gpu(
     pass: &ForwardPass,
     dims: &[usize],
     weights: &[DMatrix<f64>],
+    frames: usize,
 ) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
     let mut matrices_buffer_contents = Vec::new();
     for dim in dims.iter() {
@@ -283,7 +345,7 @@ fn sample_gpu(
         }],
     });
     let mut images = Vec::new();
-    for ti in 0..FRAMES {
+    for ti in 0..frames {
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
         let mut scalar_buffer_contents = Vec::new();
         scalar_buffer_contents.write(&t.to_le_bytes())?;
@@ -373,9 +435,23 @@ enum Backend {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut command = Command::new("perceptron-procgen")
-        .arg(Arg::new("backend").short('b').value_parser(["cpu", "gpu"]).default_value("gpu").global(true))
-        .arg(Arg::new("dimensions").short('d').default_value("[11, 10, 10, 3]").global(true))
-        .subcommand(Command::new("forward")) ;
+        .arg(
+            Arg::new("backend")
+                .short('b')
+                .value_parser(["cpu", "gpu"])
+                .default_value("gpu")
+                .global(true),
+        )
+        .arg(
+            Arg::new("dimensions")
+                .short('d')
+                .default_value("[11, 10, 10, 3]")
+                .global(true),
+        )
+        .subcommand(Command::new("forward"))
+        .subcommand(
+            Command::new("backward").arg(Arg::new("target_image").short('t').required(true)),
+        );
     let command_help = command.render_help();
     let matches = command.get_matches();
     let backend = match matches.get_one::<String>("backend").map(|x| &**x) {
@@ -385,12 +461,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    let dims = serde_json::from_str::<Vec<usize>>(&**matches.get_one::<String>("dimensions").unwrap())?;
+    let dims =
+        serde_json::from_str::<Vec<usize>>(&**matches.get_one::<String>("dimensions").unwrap())?;
 
     match matches.subcommand() {
         Some(("forward", matches)) => {
-            //let dims = vec![11, 10, 10, 3];
-
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
             let pass = ForwardPass::new(&ctx);
             for seed in 0..3 {
@@ -398,7 +473,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match backend {
                     Backend::Cpu => {
                         let pre = Instant::now();
-                        let imgs = sample(&weights);
+                        let imgs = sample(&weights, FRAMES);
                         let post = Instant::now();
                         let duration = post.duration_since(pre);
                         println!(
@@ -412,7 +487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Backend::Gpu => {
                         let pre = Instant::now();
-                        let imgs = sample_gpu(&ctx, &pass, &dims, &weights)?;
+                        let imgs = sample_gpu(&ctx, &pass, &dims, &weights, FRAMES)?;
                         let post = Instant::now();
                         let duration = post.duration_since(pre);
                         println!(
@@ -425,6 +500,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+        }
+        Some(("backward", matches)) => {
+            let mut weights = gen_weights(0, &dims);
+            let target_image_path =
+                PathBuf::from(matches.get_one::<String>("target_image").unwrap());
+            let file = File::open(&target_image_path)?;
+            let reader = BufReader::new(file);
+            let target_image =
+                image::load(reader, ImageFormat::from_path(&target_image_path).unwrap())?;
+            let target_image = target_image.to_rgb8();
+            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
+            let pass = ForwardPass::new(&ctx);
+            for i in 0..100 {
+                let pre = Instant::now();
+                backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
+                let post = Instant::now();
+                let duration = post.duration_since(pre);
+                println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
+                println!("{:?}", weights);
+                let imgs = sample_gpu(&ctx, &pass, &dims, &weights, 1)?;
+                imgs[0].save(&format!("backprop_{:02}.png", i))?;
             }
         }
         _ => {

@@ -4,6 +4,8 @@ let IMAGE_SIZE: f32 = 512.0;
 let IMAGE_SCALE: f32 = 8.0;
 //let IMAGE_SCALE: f32 = 32.0;
 let POLYNOMIAL_FEATURES: bool = true;
+let MAX_DIM: u32 = 16u;
+let MAX_DIM_QUARTER: u32 = 4u; // TODO: const eval in naga?
 
 struct Matrices {
     dims: array<u32, NUM_LAYERS>,
@@ -26,32 +28,32 @@ fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec
     }
 }
 
-fn do_mm(x: array<f32, 16>, m: u32, n: u32, offset: u32) -> array<f32, 16> {
+fn do_mm(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u32) -> array<f32, MAX_DIM> {
     // x is m by 1
     // weights is m by n
     // out is n by 1
-    var out: array<f32, 16> = array<f32, 16>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    // TODO: why does naga disallow indexing into a function parameter by a loop index?
-    var y: array<f32, 16> = x;
+    var out: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
+    // as of https://github.com/gpuweb/gpuweb/pull/1801, WGSL disallows indexing into a function parameter by a loop index
+    var y: array<f32, MAX_DIM> = x;
     for(var j: u32 = 0u; j < n; j++) {
-        for(var k: u32 = 0u; k < min(16u, m); k++) {
+        for(var k: u32 = 0u; k < min(MAX_DIM, m); k++) {
             out[j] += matrices.weights[offset + j + k * n] * y[k];
         }
     }
-    for(var k: u32 = 0u; k < 16u; k++) {
+    for(var k: u32 = 0u; k < MAX_DIM; k++) {
         out[k] = tanh(out[k]);
         //out[k] = max(0.0, out[k]);
     }
     return out;
 }
 
-fn do_mm4(x: array<vec4<f32>, 4>, m: u32, n: u32, offset: u32) -> array<vec4<f32>, 4> {
+fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> array<vec4<f32>, MAX_DIM_QUARTER> {
     // x is m by 1
     // weights is m by n
     // out is n by 1
-    var out = array<vec4<f32>, 4>();
-    let m = min(16u, m);
+    var out = array<vec4<f32>, MAX_DIM_QUARTER>();
     var y = x;
+    let m = min(MAX_DIM, m);
     for(var j: u32 = 0u; j < n/4u; j++) {
         //let nn = min(4u, n - 4u*j);
         for(var k: u32 = 0u; k < m/4u; k++) {
@@ -106,7 +108,7 @@ fn do_mm4(x: array<vec4<f32>, 4>, m: u32, n: u32, offset: u32) -> array<vec4<f32
         }
         out[j] += z * y[k];
     }
-    for(var k: u32 = 0u; k < 4u; k++) {
+    for(var k: u32 = 0u; k < MAX_DIM_QUARTER; k++) {
         out[k] = tanh(out[k]);
     }
     return out;
@@ -116,13 +118,13 @@ fn do_mm4(x: array<vec4<f32>, 4>, m: u32, n: u32, offset: u32) -> array<vec4<f32
 fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let u: f32 = IMAGE_SCALE * ((position.x / IMAGE_SIZE) - 0.5);
     let v: f32 = IMAGE_SCALE * ((position.y / IMAGE_SIZE) - 0.5);
-    //var tmp: array<f32, 16> = array<f32, 16>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
-    //var tmp: array<f32, 16> = array<f32, 16>(time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    var tmp: array<vec4<f32>, 4>;
+    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var tmp: array<vec4<f32>, MAX_DIM_QUARTER>;
     if POLYNOMIAL_FEATURES {
-        tmp = array<vec4<f32>, 4>(vec4(time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
     } else {
-        tmp = array<vec4<f32>, 4>(vec4(time, 1.0, u, v), vec4(cos(u), cos(v), 0.0, 0.0), vec4<f32>(), vec4<f32>());
+        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(cos(u), cos(v), 0.0, 0.0), vec4<f32>(), vec4<f32>());
     }
     var offset: u32 = 0u;
     for(var matrix_index: u32 = 0u; matrix_index < (NUM_LAYERS - 1u); matrix_index++) {

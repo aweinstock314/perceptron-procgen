@@ -18,9 +18,9 @@ use wgpu::{
     ImageCopyTexture, ImageDataLayout, Instance, Maintain, MapMode, MultisampleState, Operations,
     Origin3d, PipelineLayout, PipelineLayoutDescriptor, PrimitiveState, Queue,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    VertexBufferLayout, VertexState, VertexStepMode,
+    ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages, Texture, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode,
 };
 
 const SIZE: u32 = 512;
@@ -102,14 +102,18 @@ struct GPUContext {
     adapter: Adapter,
     device: Device,
     queue: Queue,
+    shaders: ShaderModule,
+    matrices_bind_group_layout: BindGroupLayout,
+    scalar_bind_group_layout: BindGroupLayout,
+}
+
+struct ForwardPass {
     pipeline: RenderPipeline,
     vertex_buffer: Buffer,
     size_extent: Extent3d,
     texture: Texture,
     texture_view: TextureView,
     texture_buffer: Buffer,
-    matrices_bind_group_layout: BindGroupLayout,
-    scalar_bind_group_layout: BindGroupLayout,
 }
 
 impl GPUContext {
@@ -156,45 +160,66 @@ impl GPUContext {
                     count: None,
                 }],
             });
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[&matrices_bind_group_layout, &scalar_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            shaders,
+            matrices_bind_group_layout,
+            scalar_bind_group_layout,
+        })
+    }
+}
+
+impl ForwardPass {
+    fn new(ctx: &GPUContext) -> Self {
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[
+                    &ctx.matrices_bind_group_layout,
+                    &ctx.scalar_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
         let vertex_layout = VertexBufferLayout {
             array_stride: 0,
             step_mode: VertexStepMode::Vertex,
             attributes: &[],
         };
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &shaders,
-                entry_point: &"vert_main",
-                buffers: &[vertex_layout],
-            },
-            primitive: PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            fragment: Some(FragmentState {
-                module: &shaders,
-                entry_point: &"frag_main",
-                targets: &[Some(ColorTargetState {
-                    format: TextureFormat::Rgba8Unorm,
-                    blend: Some(BlendState::REPLACE),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-        });
-        let vertex_buffer = device.create_buffer(&BufferDescriptor {
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &ctx.shaders,
+                    entry_point: &"vert_main",
+                    buffers: &[vertex_layout],
+                },
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    module: &ctx.shaders,
+                    entry_point: &"frag_main",
+                    targets: &[Some(ColorTargetState {
+                        format: TextureFormat::Rgba8Unorm,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+        let vertex_buffer = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
             size: 0,
             usage: BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
-        let texture_buffer = device.create_buffer(&BufferDescriptor {
+        let texture_buffer = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
             size: (4 * SIZE * SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
@@ -205,7 +230,7 @@ impl GPUContext {
             height: SIZE,
             depth_or_array_layers: 1,
         };
-        let texture = device.create_texture(&TextureDescriptor {
+        let texture = ctx.device.create_texture(&TextureDescriptor {
             label: None,
             size: size_extent,
             mip_level_count: 1,
@@ -215,25 +240,20 @@ impl GPUContext {
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
         });
         let texture_view = texture.create_view(&TextureViewDescriptor::default());
-        Ok(Self {
-            instance,
-            adapter,
-            device,
-            queue,
+        Self {
             pipeline,
             vertex_buffer,
             size_extent,
             texture,
             texture_view,
             texture_buffer,
-            matrices_bind_group_layout,
-            scalar_bind_group_layout,
-        })
+        }
     }
 }
 
 fn sample_gpu(
-    ctxt: &GPUContext,
+    ctx: &GPUContext,
+    pass: &ForwardPass,
     dims: &[usize],
     weights: &[DMatrix<f64>],
 ) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
@@ -248,14 +268,14 @@ fn sample_gpu(
             }
         }
     }
-    let matrices_buffer = ctxt.device.create_buffer_init(&BufferInitDescriptor {
+    let matrices_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
         label: None,
         contents: &matrices_buffer_contents,
         usage: BufferUsages::STORAGE,
     });
-    let matrices_bind_group = ctxt.device.create_bind_group(&BindGroupDescriptor {
+    let matrices_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
         label: None,
-        layout: &ctxt.matrices_bind_group_layout,
+        layout: &ctx.matrices_bind_group_layout,
         entries: &[BindGroupEntry {
             binding: 0,
             resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
@@ -266,76 +286,76 @@ fn sample_gpu(
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
         let mut scalar_buffer_contents = Vec::new();
         scalar_buffer_contents.write(&t.to_le_bytes())?;
-        let scalar_buffer = ctxt.device.create_buffer_init(&BufferInitDescriptor {
+        let scalar_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
             label: None,
             contents: &scalar_buffer_contents,
             usage: BufferUsages::UNIFORM,
         });
-        let scalar_bind_group = ctxt.device.create_bind_group(&BindGroupDescriptor {
+        let scalar_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
             label: None,
-            layout: &ctxt.scalar_bind_group_layout,
+            layout: &ctx.scalar_bind_group_layout,
             entries: &[BindGroupEntry {
                 binding: 0,
                 resource: BindingResource::Buffer(scalar_buffer.as_entire_buffer_binding()),
             }],
         });
-        let mut encoder = ctxt
+        let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
         {
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &ctxt.texture_view,
+                    view: &pass.texture_view,
                     resolve_target: None,
                     ops: Operations::default(),
                 })],
                 depth_stencil_attachment: None,
             });
-            render_pass.set_pipeline(&ctxt.pipeline);
+            render_pass.set_pipeline(&pass.pipeline);
             render_pass.set_bind_group(0, &matrices_bind_group, &[]);
             render_pass.set_bind_group(1, &scalar_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, ctxt.vertex_buffer.slice(..));
+            render_pass.set_vertex_buffer(0, pass.vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
             drop(render_pass);
             encoder.copy_texture_to_buffer(
                 ImageCopyTexture {
-                    texture: &ctxt.texture,
+                    texture: &pass.texture,
                     mip_level: 0,
                     origin: Origin3d::ZERO,
                     aspect: TextureAspect::All,
                 },
                 ImageCopyBuffer {
-                    buffer: &ctxt.texture_buffer,
+                    buffer: &pass.texture_buffer,
                     layout: ImageDataLayout {
                         offset: 0,
                         bytes_per_row: NonZeroU32::new(4 * SIZE),
                         rows_per_image: NonZeroU32::new(SIZE),
                     },
                 },
-                ctxt.size_extent,
+                pass.size_extent,
             );
         }
-        let submission = ctxt.queue.submit([encoder.finish()]);
+        let submission = ctx.queue.submit([encoder.finish()]);
         let (img_tx, img_rx) = mpsc::channel();
-        ctxt.texture_buffer
+        pass.texture_buffer
             .slice(..)
             .map_async(MapMode::Read, move |_| {
                 let _ = img_tx.send(());
             });
-        while !ctxt
+        while !ctx
             .device
             .poll(Maintain::WaitForSubmissionIndex(submission))
         {}
         while let Ok(()) = img_rx.recv() {
             let image_bytes = Vec::from_iter(
-                ctxt.texture_buffer
+                pass.texture_buffer
                     .slice(..)
                     .get_mapped_range()
                     .iter()
                     .copied(),
             );
-            ctxt.texture_buffer.unmap();
+            pass.texture_buffer.unmap();
             let image = RgbaImage::from_raw(SIZE, SIZE, image_bytes).unwrap();
             images.push(image);
         }
@@ -349,6 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dims = vec![11, 10, 10, 3];
 
     let ctx = futures_executor::block_on(GPUContext::new())?;
+    let pass = ForwardPass::new(&ctx);
     for seed in 0..3 {
         let weights = gen_weights(seed, &dims);
         if false {
@@ -366,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             let pre = Instant::now();
-            let imgs = sample_gpu(&ctx, &dims, &weights)?;
+            let imgs = sample_gpu(&ctx, &pass, &dims, &weights)?;
             let post = Instant::now();
             let duration = post.duration_since(pre);
             println!(

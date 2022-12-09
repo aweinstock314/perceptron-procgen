@@ -9,7 +9,7 @@ let MAX_DIM_QUARTER: u32 = 4u; // TODO: const eval in naga?
 
 struct Matrices {
     dims: array<u32, NUM_LAYERS>,
-    weights: array<f32>,
+    weights: array<atomic<u32>>,
 }
 
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
@@ -18,6 +18,9 @@ struct Matrices {
 @group(2) @binding(0) var<storage, read_write> write_matrices: Matrices;
 @group(2) @binding(1) var<storage, read> target_image: array<vec3<f32>, 262144>;
 //@group(2) @binding(2) var<uniform> alpha: f64;
+
+//var<workgroup> foo: atomic<u32> = atomic<u32>(0u);
+//var<workgroup> foo: u32 = 0u;
 
 @vertex
 fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
@@ -41,7 +44,7 @@ fn do_mm(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u32) -> array<f32, MAX_
     var y: array<f32, MAX_DIM> = x;
     for(var j: u32 = 0u; j < n; j++) {
         for(var k: u32 = 0u; k < min(MAX_DIM, m); k++) {
-            out[j] += matrices.weights[offset + j + k * n] * y[k];
+            out[j] += bitcast<f32>(atomicLoad(&matrices.weights[offset + j + k * n])) * y[k];
         }
     }
     for(var k: u32 = 0u; k < MAX_DIM; k++) {
@@ -49,6 +52,18 @@ fn do_mm(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u32) -> array<f32, MAX_
         //out[k] = max(0.0, out[k]);
     }
     return out;
+}
+
+fn matrix_vector_transpose_dot(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u32) -> array<f32, MAX_DIM> {
+    var out: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
+    var y: array<f32, MAX_DIM> = x;
+    for(var j: u32 = 0u; j < min(MAX_DIM, n); j++) {
+        for(var k: u32 = 0u; k < min(MAX_DIM, m); k++) {
+            out[k] += bitcast<f32>(atomicLoad(&matrices.weights[offset + j * m + k])) * y[j];
+        }
+    }
+    return out;
+
 }
 
 fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> array<vec4<f32>, MAX_DIM_QUARTER> {
@@ -66,7 +81,7 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
             // if we used nn/mm directly here, we'd get a slowdown relative to the unvectorized version due to excessive branching
             for(var i=0u; i<4u; i++) {
                 for(var l=0u; l<4u; l++) {
-                    z[l][i] = matrices.weights[offset + (4u*j+i) + (4u*k+l) * n];
+                    z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
                 }
             }
             out[j] += z * y[k];
@@ -80,7 +95,7 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
             var z = mat4x4<f32>();
             for(var i=0u; i<nn; i++) {
                 for(var l=0u; l<4u; l++) {
-                    z[l][i] = matrices.weights[offset + (4u*j+i) + (4u*k+l) * n];
+                    z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
                 }
             }
             out[j] += z * y[k];
@@ -93,7 +108,7 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
             var z = mat4x4<f32>();
             for(var i=0u; i<4u; i++) {
                 for(var l=0u; l<mm; l++) {
-                    z[l][i] = matrices.weights[offset + (4u*j+i) + (4u*k+l) * n];
+                    z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
                 }
             }
             out[j] += z * y[k];
@@ -107,7 +122,7 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
         var z = mat4x4<f32>();
         for(var i=0u; i<nn; i++) {
             for(var l=0u; l<mm; l++) {
-                z[l][i] = matrices.weights[offset + (4u*j+i) + (4u*k+l) * n];
+                z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
             }
         }
         out[j] += z * y[k];
@@ -146,7 +161,8 @@ fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 }
 
 @compute @workgroup_size(1)
-fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
+    let alpha = 0.001;
     let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / IMAGE_SIZE) - 0.5);
     let u = position.x;
     let v = position.y;
@@ -165,13 +181,48 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) 
     bk[0] = pixel[0];
     bk[1] = pixel[1];
     bk[2] = pixel[2];
-    for(var i = 0u; i < MAX_DIM; i++) {
+    for(var i = 0u; i < min(matrices.dims[NUM_LAYERS - 1u], MAX_DIM); i++) {
         fw[0][i] = tanh(fw[0][i]);
         bk[i] = fw[NUM_LAYERS - 1u][i] - bk[i];
     }
-    for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
-        for(var j = 0u; j < MAX_DIM; i++) {
-            fw_prime[j] = 1.0 - pow(fw[NUM_LAYERS - 1u - i][j], 2.0);
+    for(var layer = 0u; layer < (NUM_LAYERS - 1u); layer++) {
+        let layer_back = NUM_LAYERS - 1u - layer;
+        let m: u32 = matrices.dims[layer_back - 1u];
+        let n: u32 = matrices.dims[layer_back];
+        for(var i = 0u; i < n; i++) {
+            fw_prime[i] = 1.0 - pow(fw[layer_back][i], 2.0);
+        }
+        offset -= m * n;
+        for(var i = 0u; i < m; i++) {
+            for(var j = 0u; j < n; j++) {
+                //write_matrices.weights[offset + j + i * n] -= alpha * bk[j] * fw[layer_back][j];
+                let weightPtr = &write_matrices.weights[offset + j + i * n];
+                storageBarrier();
+                workgroupBarrier();
+                var old = atomicLoad(weightPtr);
+                var exchanged = false;
+                for(var k=0u; !exchanged /*&& k < 100u*/; k++) {
+                    let newValF32 = bitcast<f32>(old) + 1.0;
+                    //let newValF32 = bitcast<f32>(old) - alpha * bk[j] * fw[layer_back][j];
+                    let newVal = bitcast<u32>(newValF32);
+                    let result = atomicCompareExchangeWeak(weightPtr, old, newVal);
+                    storageBarrier();
+                    workgroupBarrier();
+                    //var result = atomicExchange(weightPtr, newVal);
+                    //old = result.old_value;
+                    //exchanged = result.exchanged;
+                    //exchanged = result != newVal;
+                    //exchanged = result == old;
+                    //old = result;
+                    //old = atomicLoad(weightPtr);
+                    //exchanged = true;
+                }
+            }
+        }
+        //var bk_dot_w = matrix_vector_transpose_dot(bk, m, n, offset);
+        var bk_dot_w = array<f32, MAX_DIM>();
+        for(var i = 0u; i < min(m, MAX_DIM); i++) {
+            bk[i] = fw_prime[i] * bk_dot_w[i];
         }
     }
 }

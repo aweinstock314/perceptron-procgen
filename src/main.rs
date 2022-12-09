@@ -14,16 +14,17 @@ use std::{
 };
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
-    Adapter, Backends, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
+    Adapter, Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
     BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, BlendState,
     Buffer, BufferBindingType, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, Device, DeviceDescriptor, Extent3d, FragmentState, ImageCopyBuffer,
-    ImageCopyTexture, ImageDataLayout, Instance, Maintain, MapMode, MultisampleState, Operations,
-    Origin3d, PipelineLayout, PipelineLayoutDescriptor, PrimitiveState, Queue,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages, Texture, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode, ComputePipeline, ComputePipelineDescriptor, BindGroup,ComputePassDescriptor
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, ComputePipelineDescriptor,
+    Device, DeviceDescriptor, Extent3d, FragmentState, ImageCopyBuffer, ImageCopyTexture,
+    ImageDataLayout, Instance, Maintain, MapMode, MultisampleState, Operations, Origin3d,
+    PipelineLayout, PipelineLayoutDescriptor, PrimitiveState, Queue, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModule,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    VertexBufferLayout, VertexState, VertexStepMode,
 };
 
 const SIZE: u32 = 512;
@@ -183,7 +184,6 @@ struct ForwardPass {
 
 struct BackwardPass {
     pipeline: ComputePipeline,
-    target_image: Buffer,
     num_weights: usize,
     weights_size: u64,
     output_weights: Buffer,
@@ -193,6 +193,9 @@ struct BackwardPass {
 
 impl GPUContext {
     async fn new(dims: &[usize]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut shader_source = String::new();
+        let mut shader_source_file = BufReader::new(File::open("src/shaders.wgsl")?);
+        shader_source_file.read_to_string(&mut shader_source)?;
         let instance = Instance::new(Backends::PRIMARY);
         let adapter = instance
             .enumerate_adapters(Backends::PRIMARY)
@@ -205,7 +208,8 @@ impl GPUContext {
         println!("{:?}", device);
         let shaders = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
-            source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
+            //source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
+            source: ShaderSource::Wgsl(Cow::Owned(shader_source)),
         });
         let matrices_bind_group_layout =
             device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -245,7 +249,11 @@ impl GPUContext {
             scalar_bind_group_layout,
         })
     }
-    fn matrices_bind_group(&self, dims: &[usize], weights: &[DMatrix<f64>]) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>>  {
+    fn matrices_bind_group(
+        &self,
+        dims: &[usize],
+        weights: &[DMatrix<f64>],
+    ) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
         let mut matrices_buffer_contents = Vec::new();
         for dim in dims.iter() {
             matrices_buffer_contents.write_u32::<LittleEndian>(*dim as u32)?;
@@ -373,32 +381,34 @@ impl ForwardPass {
 
 impl BackwardPass {
     fn new(ctx: &GPUContext, dims: &[usize]) -> Self {
-        let image_bytes = 3 * 4 * SIZE as u64 * SIZE as u64;
+        let image_bytes = 4 * 4 * SIZE as u64 * SIZE as u64;
         let backprop_bind_group_layout =
-            ctx.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: None,
-                entries: &[BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(4 * dims.len() as u64 + 4),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(image_bytes),
-                    },
-                    count: None,
-                },
-                ],
-            });
+            ctx.device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[
+                        BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: ShaderStages::COMPUTE,
+                            ty: BindingType::Buffer {
+                                ty: BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: NonZeroU64::new(4 * dims.len() as u64 + 4),
+                            },
+                            count: None,
+                        },
+                        BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: ShaderStages::COMPUTE,
+                            ty: BindingType::Buffer {
+                                ty: BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: NonZeroU64::new(image_bytes),
+                            },
+                            count: None,
+                        },
+                    ],
+                });
         let pipeline_layout = ctx
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -418,12 +428,6 @@ impl BackwardPass {
                 module: &ctx.shaders,
                 entry_point: &"backprop_gpu",
             });
-        let target_image = ctx.device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: image_bytes,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: true,
-        });
         let mut num_weights = 0;
         for (i, j) in dims.iter().zip(dims[1..].iter()) {
             num_weights += *i * *j;
@@ -443,7 +447,6 @@ impl BackwardPass {
         });
         Self {
             pipeline,
-            target_image,
             num_weights,
             weights_size,
             output_weights,
@@ -451,7 +454,11 @@ impl BackwardPass {
             backprop_bind_group_layout,
         }
     }
-    fn backprop_bind_group(&self, ctx: &GPUContext, target_image: &RgbImage) -> Result<BindGroup, Box<dyn std::error::Error>> {
+    fn backprop_bind_group(
+        &self,
+        ctx: &GPUContext,
+        target_image: &RgbImage,
+    ) -> Result<BindGroup, Box<dyn std::error::Error>> {
         let mut image_buffer_contents = Vec::new();
         for y in 0..SIZE {
             for x in 0..SIZE {
@@ -459,9 +466,11 @@ impl BackwardPass {
                 let r: f32 = 2.0 * (pixel.0[0] as f32 / 255.0) - 1.0;
                 let g: f32 = 2.0 * (pixel.0[1] as f32 / 255.0) - 1.0;
                 let b: f32 = 2.0 * (pixel.0[2] as f32 / 255.0) - 1.0;
+                //let (r, g, b) = (1.0f32, 1.0f32, 1.0f32);
                 image_buffer_contents.write(&r.to_le_bytes())?;
                 image_buffer_contents.write(&g.to_le_bytes())?;
                 image_buffer_contents.write(&b.to_le_bytes())?;
+                image_buffer_contents.write(&[0u8; 4])?;
             }
         }
         let target_image_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
@@ -475,12 +484,16 @@ impl BackwardPass {
             entries: &[
                 BindGroupEntry {
                     binding: 0,
-                    resource: BindingResource::Buffer(self.output_weights.as_entire_buffer_binding()),
+                    resource: BindingResource::Buffer(
+                        self.output_weights.as_entire_buffer_binding(),
+                    ),
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: BindingResource::Buffer(target_image_buffer.as_entire_buffer_binding()),
-                }
+                    resource: BindingResource::Buffer(
+                        target_image_buffer.as_entire_buffer_binding(),
+                    ),
+                },
             ],
         });
         Ok(backprop_bind_group)
@@ -565,14 +578,28 @@ fn sample_gpu(
     Ok(images)
 }
 
-fn backprop_gpu(ctx: &GPUContext, pass: &BackwardPass, dims: &[usize], weights: &mut [DMatrix<f64>], t: f32, alpha: f64, backprop_bind_group: &BindGroup) -> Result<(), Box<dyn std::error::Error>> {
+fn backprop_gpu(
+    ctx: &GPUContext,
+    pass: &BackwardPass,
+    dims: &[usize],
+    weights: &mut [DMatrix<f64>],
+    t: f32,
+    alpha: f64,
+    backprop_bind_group: &BindGroup,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
     let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t)?;
     let mut encoder = ctx
         .device
         .create_command_encoder(&CommandEncoderDescriptor::default());
     {
-        encoder.copy_buffer_to_buffer(&matrices_buffer, 0, &pass.output_weights, 0, matrices_buffer.size());
+        encoder.copy_buffer_to_buffer(
+            &matrices_buffer,
+            0,
+            &pass.output_weights,
+            0,
+            matrices_buffer.size(),
+        );
         let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
         compute_pass.set_pipeline(&pass.pipeline);
         compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
@@ -580,7 +607,13 @@ fn backprop_gpu(ctx: &GPUContext, pass: &BackwardPass, dims: &[usize], weights: 
         compute_pass.set_bind_group(2, backprop_bind_group, &[]);
         compute_pass.dispatch_workgroups(SIZE, SIZE, 1);
         drop(compute_pass);
-        encoder.copy_buffer_to_buffer(&pass.output_weights, 0, &pass.output_weights_copy, 0, pass.output_weights.size());
+        encoder.copy_buffer_to_buffer(
+            &pass.output_weights,
+            0,
+            &pass.output_weights_copy,
+            0,
+            pass.output_weights.size(),
+        );
     }
     let submission = ctx.queue.submit([encoder.finish()]);
     let (weights_tx, weights_rx) = mpsc::channel();
@@ -597,15 +630,6 @@ fn backprop_gpu(ctx: &GPUContext, pass: &BackwardPass, dims: &[usize], weights: 
         let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
         let mut cursor = std::io::Cursor::new(weights_slice);
         cursor.set_position(4 * dims.len() as u64);
-        /*for (k, (m, n)) in dims.iter().zip(dims[1..].iter()).enumerate() {
-            for i in 0..*m {
-                for j in 0..*n {
-                    let mut buf = [0u8; 4];
-                    cursor.read(&mut buf[..]);
-                    *weights[k].get_mut((i, j)) = f32::from_le_bytes(buf) as f64;
-                }
-            }
-        }*/
         for w in weights.iter_mut() {
             for mut row in w.row_iter_mut() {
                 for x in row.iter_mut() {
@@ -723,28 +747,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fw_pass = ForwardPass::new(&ctx);
             let bk_pass = BackwardPass::new(&ctx, &dims);
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
-            for i in 0..500 {
+            for i in 0..1 {
                 let pre = Instant::now();
                 match backend {
                     Backend::Cpu => {
                         backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
-                    },
+                    }
                     Backend::Gpu => {
-                        backprop_gpu(&ctx, &bk_pass, &dims, &mut weights, 0.0, 0.001, &backprop_bind_group)?;
-                    },
+                        backprop_gpu(
+                            &ctx,
+                            &bk_pass,
+                            &dims,
+                            &mut weights,
+                            0.0,
+                            0.001,
+                            &backprop_bind_group,
+                        )?;
+                    }
                 }
                 let post = Instant::now();
                 let duration = post.duration_since(pre);
                 println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
-                println!(
-                    "{}",
-                    serde_json::to_string(
-                        &weights
-                            .iter()
-                            .map(|w| w.data.as_vec().clone())
-                            .collect::<Vec<Vec<f64>>>()
-                    )?
-                );
+                let serialized_weights = serde_json::to_string(
+                    &weights
+                        .iter()
+                        .map(|w| w.data.as_vec().clone())
+                        .collect::<Vec<Vec<f64>>>(),
+                )?;
+                println!("{}", serialized_weights);
                 let imgs = sample_gpu(&ctx, &fw_pass, &dims, &weights, 1)?;
                 imgs[0].save(&format!("backprop_{:02}.png", i))?;
             }

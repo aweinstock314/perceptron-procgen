@@ -6,7 +6,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     borrow::Cow,
     fs::File,
-    io::{BufReader, Write},
+    io::{BufReader, Read, Write},
     num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::mpsc,
@@ -23,7 +23,7 @@ use wgpu::{
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
     ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages, Texture, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode,
+    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode, ComputePipeline, ComputePipelineDescriptor, BindGroup,ComputePassDescriptor
 };
 
 const SIZE: u32 = 512;
@@ -124,13 +124,14 @@ fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbIm
                 ]
                 .into_iter(),
             );
-            intermediates.push(fw.clone());
+            intermediates.push(fw.map(|v| v.tanh()));
             for w in weights.iter() {
                 fw *= w;
-                intermediates.push(fw.clone());
+                //intermediates.push(fw.clone());
                 for v in fw.iter_mut() {
                     *v = v.tanh();
                 }
+                intermediates.push(fw.clone());
             }
             //println!("{:?}", intermediates);
             let target_pixel = target.get_pixel(xi, yi);
@@ -138,16 +139,18 @@ fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbIm
                 1,
                 3,
                 [
-                    target_pixel.0[0] as f64 / 255.0,
-                    target_pixel.0[1] as f64 / 255.0,
-                    target_pixel.0[2] as f64 / 255.0,
+                    2.0 * (target_pixel.0[0] as f64 / 255.0) - 1.0,
+                    2.0 * (target_pixel.0[1] as f64 / 255.0) - 1.0,
+                    2.0 * (target_pixel.0[2] as f64 / 255.0) - 1.0,
                 ],
             );
             //println!("{:?}", target_vector);
             let mut bk = fw - target_vector;
             for (fw, w) in intermediates.iter().zip(weights.iter_mut()).rev() {
-                let fw_activated = fw.map(|v| v.tanh());
-                let fw_prime = fw.map(|v| 1.0 - v.tanh().powf(2.0));
+                //let fw_activated = fw.map(|v| v.tanh());
+                let fw_activated = fw;
+                //let fw_prime = fw.map(|v| 1.0 - v.tanh().powf(2.0));
+                let fw_prime = fw_activated.map(|v| 1.0 - v.powf(2.0));
                 //println!("{:?} {:?} {:?}", w.shape(), bk.shape(), fw.shape());
                 let w_prime = bk.clone().transpose() * fw_activated;
                 //println!("{:?} {:?} {:?}", w.shape(), bk.shape(), fw.shape());
@@ -178,6 +181,16 @@ struct ForwardPass {
     texture_buffer: Buffer,
 }
 
+struct BackwardPass {
+    pipeline: ComputePipeline,
+    target_image: Buffer,
+    num_weights: usize,
+    weights_size: u64,
+    output_weights: Buffer,
+    output_weights_copy: Buffer,
+    backprop_bind_group_layout: BindGroupLayout,
+}
+
 impl GPUContext {
     async fn new(dims: &[usize]) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = Instance::new(Backends::PRIMARY);
@@ -199,7 +212,7 @@ impl GPUContext {
                 label: None,
                 entries: &[BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: ShaderStages::VERTEX_FRAGMENT,
+                    visibility: ShaderStages::VERTEX_FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -213,7 +226,7 @@ impl GPUContext {
                 label: None,
                 entries: &[BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: ShaderStages::VERTEX_FRAGMENT,
+                    visibility: ShaderStages::VERTEX_FRAGMENT | ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -231,6 +244,51 @@ impl GPUContext {
             matrices_bind_group_layout,
             scalar_bind_group_layout,
         })
+    }
+    fn matrices_bind_group(&self, dims: &[usize], weights: &[DMatrix<f64>]) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>>  {
+        let mut matrices_buffer_contents = Vec::new();
+        for dim in dims.iter() {
+            matrices_buffer_contents.write_u32::<LittleEndian>(*dim as u32)?;
+        }
+        for w in weights.iter() {
+            for row in w.row_iter() {
+                for x in row.iter() {
+                    matrices_buffer_contents.write(&(*x as f32).to_le_bytes())?;
+                }
+            }
+        }
+        let matrices_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: &matrices_buffer_contents,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+        let matrices_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.matrices_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
+            }],
+        });
+        Ok((matrices_buffer, matrices_bind_group))
+    }
+    fn scalar_bind_group(&self, t: f32) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
+        let mut scalar_buffer_contents = Vec::new();
+        scalar_buffer_contents.write(&t.to_le_bytes())?;
+        let scalar_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: &scalar_buffer_contents,
+            usage: BufferUsages::UNIFORM,
+        });
+        let scalar_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.scalar_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(scalar_buffer.as_entire_buffer_binding()),
+            }],
+        });
+        Ok((scalar_buffer, scalar_bind_group))
     }
 }
 
@@ -313,6 +371,122 @@ impl ForwardPass {
     }
 }
 
+impl BackwardPass {
+    fn new(ctx: &GPUContext, dims: &[usize]) -> Self {
+        let image_bytes = 3 * 4 * SIZE as u64 * SIZE as u64;
+        let backprop_bind_group_layout =
+            ctx.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(4 * dims.len() as u64 + 4),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(image_bytes),
+                    },
+                    count: None,
+                },
+                ],
+            });
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[
+                    &ctx.matrices_bind_group_layout,
+                    &ctx.scalar_bind_group_layout,
+                    &backprop_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &ctx.shaders,
+                entry_point: &"backprop_gpu",
+            });
+        let target_image = ctx.device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: image_bytes,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: true,
+        });
+        let mut num_weights = 0;
+        for (i, j) in dims.iter().zip(dims[1..].iter()) {
+            num_weights += *i * *j;
+        }
+        let weights_size = (4 * dims.len() + 4 * num_weights) as u64;
+        let output_weights = ctx.device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: weights_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_weights_copy = ctx.device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: weights_size,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            target_image,
+            num_weights,
+            weights_size,
+            output_weights,
+            output_weights_copy,
+            backprop_bind_group_layout,
+        }
+    }
+    fn backprop_bind_group(&self, ctx: &GPUContext, target_image: &RgbImage) -> Result<BindGroup, Box<dyn std::error::Error>> {
+        let mut image_buffer_contents = Vec::new();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let pixel = target_image.get_pixel(x, y);
+                let r: f32 = 2.0 * (pixel.0[0] as f32 / 255.0) - 1.0;
+                let g: f32 = 2.0 * (pixel.0[1] as f32 / 255.0) - 1.0;
+                let b: f32 = 2.0 * (pixel.0[2] as f32 / 255.0) - 1.0;
+                image_buffer_contents.write(&r.to_le_bytes())?;
+                image_buffer_contents.write(&g.to_le_bytes())?;
+                image_buffer_contents.write(&b.to_le_bytes())?;
+            }
+        }
+        let target_image_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: &image_buffer_contents,
+            usage: BufferUsages::STORAGE,
+        });
+        let backprop_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.backprop_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::Buffer(self.output_weights.as_entire_buffer_binding()),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Buffer(target_image_buffer.as_entire_buffer_binding()),
+                }
+            ],
+        });
+        Ok(backprop_bind_group)
+    }
+}
+
 fn sample_gpu(
     ctx: &GPUContext,
     pass: &ForwardPass,
@@ -320,48 +494,11 @@ fn sample_gpu(
     weights: &[DMatrix<f64>],
     frames: usize,
 ) -> Result<Vec<RgbaImage>, Box<dyn std::error::Error>> {
-    let mut matrices_buffer_contents = Vec::new();
-    for dim in dims.iter() {
-        matrices_buffer_contents.write_u32::<LittleEndian>(*dim as u32)?;
-    }
-    for w in weights.iter() {
-        for row in w.row_iter() {
-            for x in row.iter() {
-                matrices_buffer_contents.write(&(*x as f32).to_le_bytes())?;
-            }
-        }
-    }
-    let matrices_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
-        label: None,
-        contents: &matrices_buffer_contents,
-        usage: BufferUsages::STORAGE,
-    });
-    let matrices_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
-        label: None,
-        layout: &ctx.matrices_bind_group_layout,
-        entries: &[BindGroupEntry {
-            binding: 0,
-            resource: BindingResource::Buffer(matrices_buffer.as_entire_buffer_binding()),
-        }],
-    });
+    let (_, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
     let mut images = Vec::new();
     for ti in 0..frames {
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
-        let mut scalar_buffer_contents = Vec::new();
-        scalar_buffer_contents.write(&t.to_le_bytes())?;
-        let scalar_buffer = ctx.device.create_buffer_init(&BufferInitDescriptor {
-            label: None,
-            contents: &scalar_buffer_contents,
-            usage: BufferUsages::UNIFORM,
-        });
-        let scalar_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &ctx.scalar_bind_group_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::Buffer(scalar_buffer.as_entire_buffer_binding()),
-            }],
-        });
+        let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -426,6 +563,63 @@ fn sample_gpu(
     }
 
     Ok(images)
+}
+
+fn backprop_gpu(ctx: &GPUContext, pass: &BackwardPass, dims: &[usize], weights: &mut [DMatrix<f64>], t: f32, alpha: f64, backprop_bind_group: &BindGroup) -> Result<(), Box<dyn std::error::Error>> {
+    let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
+    let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t)?;
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        encoder.copy_buffer_to_buffer(&matrices_buffer, 0, &pass.output_weights, 0, matrices_buffer.size());
+        let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        compute_pass.set_pipeline(&pass.pipeline);
+        compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
+        compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
+        compute_pass.set_bind_group(2, backprop_bind_group, &[]);
+        compute_pass.dispatch_workgroups(SIZE, SIZE, 1);
+        drop(compute_pass);
+        encoder.copy_buffer_to_buffer(&pass.output_weights, 0, &pass.output_weights_copy, 0, pass.output_weights.size());
+    }
+    let submission = ctx.queue.submit([encoder.finish()]);
+    let (weights_tx, weights_rx) = mpsc::channel();
+    pass.output_weights_copy
+        .slice(..)
+        .map_async(MapMode::Read, move |_| {
+            let _ = weights_tx.send(());
+        });
+    while !ctx
+        .device
+        .poll(Maintain::WaitForSubmissionIndex(submission))
+    {}
+    while let Ok(()) = weights_rx.recv() {
+        let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
+        let mut cursor = std::io::Cursor::new(weights_slice);
+        cursor.set_position(4 * dims.len() as u64);
+        /*for (k, (m, n)) in dims.iter().zip(dims[1..].iter()).enumerate() {
+            for i in 0..*m {
+                for j in 0..*n {
+                    let mut buf = [0u8; 4];
+                    cursor.read(&mut buf[..]);
+                    *weights[k].get_mut((i, j)) = f32::from_le_bytes(buf) as f64;
+                }
+            }
+        }*/
+        for w in weights.iter_mut() {
+            for mut row in w.row_iter_mut() {
+                for x in row.iter_mut() {
+                    let mut buf = [0u8; 4];
+                    cursor.read(&mut buf[..])?;
+                    *x = f32::from_le_bytes(buf) as f64;
+                }
+            }
+        }
+        drop(cursor);
+        pass.output_weights_copy.unmap();
+    }
+    scalar_buffer.destroy();
+    Ok(())
 }
 
 enum Backend {
@@ -526,10 +720,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image::load(reader, ImageFormat::from_path(&target_image_path).unwrap())?;
             let target_image = target_image.to_rgb8();
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
-            let pass = ForwardPass::new(&ctx);
+            let fw_pass = ForwardPass::new(&ctx);
+            let bk_pass = BackwardPass::new(&ctx, &dims);
+            let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
             for i in 0..500 {
                 let pre = Instant::now();
-                backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
+                match backend {
+                    Backend::Cpu => {
+                        backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
+                    },
+                    Backend::Gpu => {
+                        backprop_gpu(&ctx, &bk_pass, &dims, &mut weights, 0.0, 0.001, &backprop_bind_group)?;
+                    },
+                }
                 let post = Instant::now();
                 let duration = post.duration_since(pre);
                 println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
@@ -542,7 +745,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .collect::<Vec<Vec<f64>>>()
                     )?
                 );
-                let imgs = sample_gpu(&ctx, &pass, &dims, &weights, 1)?;
+                let imgs = sample_gpu(&ctx, &fw_pass, &dims, &weights, 1)?;
                 imgs[0].save(&format!("backprop_{:02}.png", i))?;
             }
         }

@@ -15,6 +15,10 @@ struct Matrices {
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
 @group(1) @binding(0) var<uniform> time: f32;
 
+@group(2) @binding(0) var<storage, read_write> write_matrices: Matrices;
+@group(2) @binding(1) var<storage, read> target_image: array<vec3<f32>, 262144>;
+//@group(2) @binding(2) var<uniform> alpha: f64;
+
 @vertex
 fn vert_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
     // TODO: triangle strips
@@ -139,4 +143,35 @@ fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     var tmp2 = tmp[0];
     tmp2[3] = 1.0;
     return (tmp2 + 1.0) / 2.0;
+}
+
+@compute @workgroup_size(1)
+fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+    let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / IMAGE_SIZE) - 0.5);
+    let u = position.x;
+    let v = position.y;
+    var fw: array<array<f32, MAX_DIM>, NUM_LAYERS> = array<array<f32, MAX_DIM>, NUM_LAYERS>();
+    fw[0] = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var offset: u32 = 0u;
+    for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
+        let m: u32 = matrices.dims[i];
+        let n: u32 = matrices.dims[i+1u];
+        fw[i+1u] = do_mm(fw[i], m, n, offset);
+        offset += m * n;
+    }
+    var bk: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
+    var fw_prime: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
+    let pixel = target_image[global_invocation_id.y * u32(IMAGE_SIZE) + global_invocation_id.x];
+    bk[0] = pixel[0];
+    bk[1] = pixel[1];
+    bk[2] = pixel[2];
+    for(var i = 0u; i < MAX_DIM; i++) {
+        fw[0][i] = tanh(fw[0][i]);
+        bk[i] = fw[NUM_LAYERS - 1u][i] - bk[i];
+    }
+    for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
+        for(var j = 0u; j < MAX_DIM; i++) {
+            fw_prime[j] = 1.0 - pow(fw[NUM_LAYERS - 1u - i][j], 2.0);
+        }
+    }
 }

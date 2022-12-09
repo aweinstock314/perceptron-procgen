@@ -69,7 +69,16 @@ fn matrix_vector_transpose_dot(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u
         }
     }
     return out;
-
+}
+fn matrix_vector_transpose_dot4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> array<vec4<f32>, MAX_DIM_QUARTER> {
+    var out: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
+    var y: array<vec4<f32>, MAX_DIM_QUARTER> = x;
+    for(var j: u32 = 0u; j < n; j++) {
+        for(var k: u32 = 0u; k < m; k++) {
+            out[k/4u][k%4u] += bitcast<f32>(atomicLoad(&matrices.weights[offset + j + k * n])) * y[j/4u][j%4u];
+        }
+    }
+    return out;
 }
 
 fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> array<vec4<f32>, MAX_DIM_QUARTER> {
@@ -173,33 +182,43 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
     let u = position.x;
     let v = position.y;
-    var fw: array<array<f32, MAX_DIM>, NUM_LAYERS> = array<array<f32, MAX_DIM>, NUM_LAYERS>();
-    fw[0] = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    var fw: array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS> = array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS>();
+    //fw[0] = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    fw[0] = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
     var offset: u32 = 0u;
     for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
         let m: u32 = matrices.dims[i];
         let n: u32 = matrices.dims[i+1u];
-        fw[i+1u] = do_mm(fw[i], m, n, offset);
+        fw[i+1u] = do_mm4(fw[i], m, n, offset);
         offset += m * n;
     }
-    var bk: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
-    var fw_prime: array<f32, MAX_DIM> = array<f32, MAX_DIM>();
+    var bk: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
+    var fw_prime: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     let pixel = target_image[global_invocation_id.y * u32(IMAGE_SIZE) + global_invocation_id.x];
-    bk[0] = pixel[0];
-    bk[1] = pixel[1];
-    bk[2] = pixel[2];
-    for(var i = 0u; i < matrices.dims[0]; i++) {
+    bk[0] = vec4(pixel[0], pixel[1], pixel[2], 0.0);
+    let sz = matrices.dims[0];
+    for(var i = 0u; i < sz/4u; i++) {
         fw[0][i] = tanh(fw[0][i]);
     }
-    for(var i = 0u; i < matrices.dims[NUM_LAYERS - 1u]; i++) {
+    for(var i = 0u; i < sz%4u; i++) {
+        fw[0][sz/4u][i] = tanh(fw[0][sz/4u][i]);
+    }
+    let sz = matrices.dims[NUM_LAYERS - 1u];
+    for(var i = 0u; i < sz/4u; i++) {
         bk[i] = fw[NUM_LAYERS - 1u][i] - bk[i];
+    }
+    for(var i = 0u; i < sz%4u; i++) {
+        bk[sz/4u][i] = fw[NUM_LAYERS - 1u][sz/4u][i] - bk[sz/4u][i];
     }
     for(var layer = 0u; layer < (NUM_LAYERS - 1u); layer++) {
         let layer_back = NUM_LAYERS - 1u - layer;
         let m: u32 = matrices.dims[layer_back - 1u];
         let n: u32 = matrices.dims[layer_back];
-        for(var i = 0u; i < n; i++) {
-            fw_prime[i] = 1.0 - pow(fw[layer_back][i], 2.0);
+        for(var i = 0u; i < n/4u; i++) {
+            fw_prime[i] = 1.0 - fw[layer_back][i] * fw[layer_back][i];
+        }
+        for(var i = 0u; i < n%4u; i++) {
+            fw_prime[n/4u][i] = 1.0 - fw[layer_back][n/4u][i] * fw[layer_back][n/4u][i];
         }
         offset -= m * n;
         for(var i = 0u; i < m; i++) {
@@ -210,7 +229,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
                 var exchanged = false;
                 for(var k=0u; !exchanged /*&& k < 100u*/; k++) {
                     //let newValF32 = bitcast<f32>(old) + 1.0;
-                    let newValF32 = bitcast<f32>(old) - alpha * bk[j] * fw[layer_back - 1u][i];
+                    let newValF32 = bitcast<f32>(old) - alpha * bk[j/4u][j%4u] * fw[layer_back - 1u][i/4u][i%4u];
                     //let newValF32 = bitcast<f32>(old);
                     let newVal = bitcast<u32>(newValF32);
                     let result = atomicCompareExchangeWeak(weightPtr, old, newVal);
@@ -219,10 +238,13 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
                 }
             }
         }
-        var bk_dot_w = matrix_vector_transpose_dot(bk, m, n, offset);
+        var bk_dot_w = matrix_vector_transpose_dot4(bk, m, n, offset);
         //var bk_dot_w = array<f32, MAX_DIM>();
-        for(var i = 0u; i < m; i++) {
+        for(var i = 0u; i < m/4u; i++) {
             bk[i] = fw_prime[i] * bk_dot_w[i];
+        }
+        for(var i = 0u; i < m%4u; i++) {
+            bk[m/4u][i] = fw_prime[m/4u][i] * bk_dot_w[m/4u][i];
         }
     }
 }

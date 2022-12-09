@@ -701,8 +701,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262d2840e72dbe250e8cf2f522d080988dfca624c4112c096238a4845f591707"
+source = "git+https://github.com/aweinstock314/naga?branch=atomic-compare-exchange-spirv#ee026e84746a34f37e4dca73493ef6f5da795621"
 dependencies = [
  "bit-set",
  "bitflags",

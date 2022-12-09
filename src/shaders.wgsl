@@ -59,7 +59,7 @@ fn matrix_vector_transpose_dot(x: array<f32, MAX_DIM>, m: u32, n: u32, offset: u
     var y: array<f32, MAX_DIM> = x;
     for(var j: u32 = 0u; j < min(MAX_DIM, n); j++) {
         for(var k: u32 = 0u; k < min(MAX_DIM, m); k++) {
-            out[k] += bitcast<f32>(atomicLoad(&matrices.weights[offset + j * m + k])) * y[j];
+            out[k] += bitcast<f32>(atomicLoad(&matrices.weights[offset + j + k * n])) * y[j];
         }
     }
     return out;
@@ -181,11 +181,13 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     bk[0] = pixel[0];
     bk[1] = pixel[1];
     bk[2] = pixel[2];
-    for(var i = 0u; i < min(matrices.dims[NUM_LAYERS - 1u], MAX_DIM); i++) {
+    for(var i = 0u; i < matrices.dims[0]; i++) {
         fw[0][i] = tanh(fw[0][i]);
+    }
+    for(var i = 0u; i < matrices.dims[NUM_LAYERS - 1u]; i++) {
         bk[i] = fw[NUM_LAYERS - 1u][i] - bk[i];
     }
-    for(var layer = 0u; layer < (NUM_LAYERS - 1u); layer++) {
+    for(var layer = 0u; layer < (NUM_LAYERS - 2u); layer++) {
         let layer_back = NUM_LAYERS - 1u - layer;
         let m: u32 = matrices.dims[layer_back - 1u];
         let n: u32 = matrices.dims[layer_back];
@@ -195,32 +197,23 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
         offset -= m * n;
         for(var i = 0u; i < m; i++) {
             for(var j = 0u; j < n; j++) {
-                //write_matrices.weights[offset + j + i * n] -= alpha * bk[j] * fw[layer_back][j];
                 let weightPtr = &write_matrices.weights[offset + j + i * n];
-                storageBarrier();
-                workgroupBarrier();
                 var old = atomicLoad(weightPtr);
                 var exchanged = false;
                 for(var k=0u; !exchanged /*&& k < 100u*/; k++) {
-                    let newValF32 = bitcast<f32>(old) + 1.0;
-                    //let newValF32 = bitcast<f32>(old) - alpha * bk[j] * fw[layer_back][j];
+                    //let newValF32 = bitcast<f32>(old) + 1.0;
+                    let newValF32 = bitcast<f32>(old) - alpha * bk[j] * fw[layer_back - 1u][i];
+                    //let newValF32 = bitcast<f32>(old);
                     let newVal = bitcast<u32>(newValF32);
-                    let result = atomicCompareExchangeWeak(weightPtr, old, newVal);
                     storageBarrier();
-                    workgroupBarrier();
-                    //var result = atomicExchange(weightPtr, newVal);
-                    //old = result.old_value;
-                    //exchanged = result.exchanged;
-                    //exchanged = result != newVal;
-                    //exchanged = result == old;
-                    //old = result;
-                    //old = atomicLoad(weightPtr);
-                    //exchanged = true;
+                    let result = atomicCompareExchangeWeak(weightPtr, old, newVal);
+                    old = result.old_value;
+                    exchanged = result.exchanged;
                 }
             }
         }
-        //var bk_dot_w = matrix_vector_transpose_dot(bk, m, n, offset);
-        var bk_dot_w = array<f32, MAX_DIM>();
+        var bk_dot_w = matrix_vector_transpose_dot(bk, m, n, offset);
+        //var bk_dot_w = array<f32, MAX_DIM>();
         for(var i = 0u; i < min(m, MAX_DIM); i++) {
             bk[i] = fw_prime[i] * bk_dot_w[i];
         }

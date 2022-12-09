@@ -102,6 +102,7 @@ fn sample(weights: &[DMatrix<f64>], frames: usize) -> Vec<RgbImage> {
 }
 
 fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbImage) {
+    let mut weights_copy: Vec<DMatrix<f64>> = weights.iter().cloned().collect();
     for yi in 0..SIZE {
         for xi in 0..SIZE {
             let x = 8.0 * (xi as f64 - (SIZE / 2) as f64) / SIZE as f64;
@@ -147,7 +148,7 @@ fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbIm
             );
             //println!("{:?}", target_vector);
             let mut bk = fw - target_vector;
-            for (fw, w) in intermediates.iter().zip(weights.iter_mut()).rev() {
+            for (fw, w) in intermediates.iter().zip(weights_copy.iter_mut()).rev() {
                 //let fw_activated = fw.map(|v| v.tanh());
                 let fw_activated = fw;
                 //let fw_prime = fw.map(|v| 1.0 - v.tanh().powf(2.0));
@@ -160,6 +161,9 @@ fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbIm
                 w.zip_apply(&w_prime.transpose(), |a, b| *a -= alpha * b);
             }
         }
+    }
+    for (w, wc) in weights.iter_mut().zip(weights_copy.into_iter()) {
+        *w = wc;
     }
 }
 
@@ -747,11 +751,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fw_pass = ForwardPass::new(&ctx);
             let bk_pass = BackwardPass::new(&ctx, &dims);
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
-            for i in 0..1 {
+            for i in 0..500 {
                 let pre = Instant::now();
                 match backend {
                     Backend::Cpu => {
-                        backprop_cpu(&mut weights, 0.0, 0.001, &target_image);
+                        backprop_cpu(&mut weights, 0.0, 0.001 / SIZE as f64, &target_image);
                     }
                     Backend::Gpu => {
                         backprop_gpu(

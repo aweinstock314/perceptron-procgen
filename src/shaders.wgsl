@@ -162,7 +162,7 @@ fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
 @compute @workgroup_size(1)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
-    let alpha = 0.001;
+    let alpha = 0.001 / IMAGE_SIZE;
     let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / IMAGE_SIZE) - 0.5);
     let u = position.x;
     let v = position.y;
@@ -187,7 +187,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     for(var i = 0u; i < matrices.dims[NUM_LAYERS - 1u]; i++) {
         bk[i] = fw[NUM_LAYERS - 1u][i] - bk[i];
     }
-    for(var layer = 0u; layer < (NUM_LAYERS - 2u); layer++) {
+    for(var layer = 0u; layer < (NUM_LAYERS - 1u); layer++) {
         let layer_back = NUM_LAYERS - 1u - layer;
         let m: u32 = matrices.dims[layer_back - 1u];
         let n: u32 = matrices.dims[layer_back];
@@ -198,6 +198,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
         for(var i = 0u; i < m; i++) {
             for(var j = 0u; j < n; j++) {
                 let weightPtr = &write_matrices.weights[offset + j + i * n];
+                storageBarrier();
                 var old = atomicLoad(weightPtr);
                 var exchanged = false;
                 for(var k=0u; !exchanged /*&& k < 100u*/; k++) {
@@ -205,7 +206,6 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
                     let newValF32 = bitcast<f32>(old) - alpha * bk[j] * fw[layer_back - 1u][i];
                     //let newValF32 = bitcast<f32>(old);
                     let newVal = bitcast<u32>(newValF32);
-                    storageBarrier();
                     let result = atomicCompareExchangeWeak(weightPtr, old, newVal);
                     old = result.old_value;
                     exchanged = result.exchanged;
@@ -214,7 +214,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
         }
         var bk_dot_w = matrix_vector_transpose_dot(bk, m, n, offset);
         //var bk_dot_w = array<f32, MAX_DIM>();
-        for(var i = 0u; i < min(m, MAX_DIM); i++) {
+        for(var i = 0u; i < m; i++) {
             bk[i] = fw_prime[i] * bk_dot_w[i];
         }
     }

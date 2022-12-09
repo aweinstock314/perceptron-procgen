@@ -190,6 +190,7 @@ struct BackwardPass {
     pipeline: ComputePipeline,
     num_weights: usize,
     weights_size: u64,
+    weight_multiplicity: u64,
     output_weights: Buffer,
     output_weights_copy: Buffer,
     backprop_bind_group_layout: BindGroupLayout,
@@ -384,7 +385,11 @@ impl ForwardPass {
 }
 
 impl BackwardPass {
-    fn new(ctx: &GPUContext, dims: &[usize]) -> Self {
+    fn new(
+        ctx: &GPUContext,
+        dims: &[usize],
+        weight_multiplicity: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let image_bytes = 4 * 4 * SIZE as u64 * SIZE as u64;
         let backprop_bind_group_layout =
             ctx.device
@@ -397,7 +402,7 @@ impl BackwardPass {
                             ty: BindingType::Buffer {
                                 ty: BufferBindingType::Storage { read_only: false },
                                 has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(4 * dims.len() as u64 + 4),
+                                min_binding_size: NonZeroU64::new(2 * 4 + 4),
                             },
                             count: None,
                         },
@@ -436,27 +441,34 @@ impl BackwardPass {
         for (i, j) in dims.iter().zip(dims[1..].iter()) {
             num_weights += *i * *j;
         }
-        let weights_size = (4 * dims.len() + 4 * num_weights) as u64;
+        let weights_size = 2 * 4 + weight_multiplicity as u64 * 4 * num_weights as u64;
         let output_weights = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
             size: weights_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            mapped_at_creation: true,
         });
+        {
+            let mut buf = &mut output_weights.slice(0..8).get_mapped_range_mut()[..];
+            buf.write_u32::<LittleEndian>(num_weights as u32)?;
+            buf.write_u32::<LittleEndian>(weight_multiplicity as u32)?;
+        }
+        output_weights.unmap();
         let output_weights_copy = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
             size: weights_size,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Self {
+        Ok(Self {
             pipeline,
             num_weights,
             weights_size,
+            weight_multiplicity,
             output_weights,
             output_weights_copy,
             backprop_bind_group_layout,
-        }
+        })
     }
     fn backprop_bind_group(
         &self,
@@ -597,19 +609,24 @@ fn backprop_gpu(
         .device
         .create_command_encoder(&CommandEncoderDescriptor::default());
     {
-        encoder.copy_buffer_to_buffer(
+        /*encoder.copy_buffer_to_buffer(
             &matrices_buffer,
             0,
             &pass.output_weights,
             0,
             matrices_buffer.size(),
+        );*/
+        encoder.clear_buffer(
+            &pass.output_weights,
+            8,
+            NonZeroU64::new(pass.output_weights.size() - 8),
         );
         let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
         compute_pass.set_pipeline(&pass.pipeline);
         compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
         compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
         compute_pass.set_bind_group(2, backprop_bind_group, &[]);
-        compute_pass.dispatch_workgroups(SIZE, SIZE, 1);
+        compute_pass.dispatch_workgroups(SIZE / 16, SIZE, 1);
         drop(compute_pass);
         encoder.copy_buffer_to_buffer(
             &pass.output_weights,
@@ -633,13 +650,15 @@ fn backprop_gpu(
     while let Ok(()) = weights_rx.recv() {
         let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
         let mut cursor = std::io::Cursor::new(weights_slice);
-        cursor.set_position(4 * dims.len() as u64);
-        for w in weights.iter_mut() {
-            for mut row in w.row_iter_mut() {
-                for x in row.iter_mut() {
-                    let mut buf = [0u8; 4];
-                    cursor.read(&mut buf[..])?;
-                    *x = f32::from_le_bytes(buf) as f64;
+        cursor.set_position(2 * dims.len() as u64);
+        for _ in 0..pass.weight_multiplicity {
+            for w in weights.iter_mut() {
+                for mut row in w.row_iter_mut() {
+                    for x in row.iter_mut() {
+                        let mut buf = [0u8; 4];
+                        cursor.read(&mut buf[..])?;
+                        *x += f32::from_le_bytes(buf) as f64;
+                    }
                 }
             }
         }
@@ -749,7 +768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let target_image = target_image.to_rgb8();
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
             let fw_pass = ForwardPass::new(&ctx);
-            let bk_pass = BackwardPass::new(&ctx, &dims);
+            let bk_pass = BackwardPass::new(&ctx, &dims, 64)?;
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
             for i in 0..500 {
                 let pre = Instant::now();

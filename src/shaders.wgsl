@@ -12,10 +12,16 @@ struct Matrices {
     weights: array<atomic<u32>>,
 }
 
+struct MatrixDeltas {
+    stride: u32,
+    count: u32,
+    weights: array<atomic<u32>>,
+}
+
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
 @group(1) @binding(0) var<uniform> time: f32;
 
-@group(2) @binding(0) var<storage, read_write> write_matrices: Matrices;
+@group(2) @binding(0) var<storage, read_write> write_matrices: MatrixDeltas;
 @group(2) @binding(1) var<storage, read> target_image: array<vec3<f32>, 262144>;
 //@group(2) @binding(2) var<uniform> alpha: f64;
 
@@ -160,10 +166,11 @@ fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     return (tmp2 + 1.0) / 2.0;
 }
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(16)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
     let alpha = 0.001 / IMAGE_SIZE;
     let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / IMAGE_SIZE) - 0.5);
+    let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
     let u = position.x;
     let v = position.y;
     var fw: array<array<f32, MAX_DIM>, NUM_LAYERS> = array<array<f32, MAX_DIM>, NUM_LAYERS>();
@@ -197,8 +204,8 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
         offset -= m * n;
         for(var i = 0u; i < m; i++) {
             for(var j = 0u; j < n; j++) {
-                let weightPtr = &write_matrices.weights[offset + j + i * n];
-                storageBarrier();
+                let weightPtr = &write_matrices.weights[multiplicity_offset + offset + j + i * n];
+                //storageBarrier();
                 var old = atomicLoad(weightPtr);
                 var exchanged = false;
                 for(var k=0u; !exchanged /*&& k < 100u*/; k++) {

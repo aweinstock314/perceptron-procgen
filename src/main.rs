@@ -187,7 +187,8 @@ struct ForwardPass {
 }
 
 struct BackwardPass {
-    pipeline: ComputePipeline,
+    backprop_pipeline: ComputePipeline,
+    sum_weights_pipeline: ComputePipeline,
     num_weights: usize,
     weights_size: u64,
     weight_multiplicity: u64,
@@ -273,7 +274,7 @@ impl GPUContext {
         let matrices_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
             label: None,
             contents: &matrices_buffer_contents,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
         });
         let matrices_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: None,
@@ -429,13 +430,21 @@ impl BackwardPass {
                 ],
                 push_constant_ranges: &[],
             });
-        let pipeline = ctx
+        let backprop_pipeline = ctx
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
                 label: None,
                 layout: Some(&pipeline_layout),
                 module: &ctx.shaders,
                 entry_point: &"backprop_gpu",
+            });
+        let sum_weights_pipeline = ctx
+            .device
+            .create_compute_pipeline(&ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &ctx.shaders,
+                entry_point: &"sum_weights",
             });
         let mut num_weights = 0;
         for (i, j) in dims.iter().zip(dims[1..].iter()) {
@@ -456,12 +465,13 @@ impl BackwardPass {
         output_weights.unmap();
         let output_weights_copy = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
-            size: weights_size,
+            size: 4 * num_weights as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         Ok(Self {
-            pipeline,
+            backprop_pipeline,
+            sum_weights_pipeline,
             num_weights,
             weights_size,
             weight_multiplicity,
@@ -601,6 +611,7 @@ fn backprop_gpu(
     weights: &mut [DMatrix<f64>],
     t: f32,
     alpha: f64,
+    epochs: usize,
     backprop_bind_group: &BindGroup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
@@ -616,24 +627,35 @@ fn backprop_gpu(
             0,
             matrices_buffer.size(),
         );*/
-        encoder.clear_buffer(
-            &pass.output_weights,
-            8,
-            NonZeroU64::new(pass.output_weights.size() - 8),
-        );
-        let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-        compute_pass.set_pipeline(&pass.pipeline);
-        compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
-        compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
-        compute_pass.set_bind_group(2, backprop_bind_group, &[]);
-        compute_pass.dispatch_workgroups(SIZE / 16, SIZE, 1);
-        drop(compute_pass);
+        for _ in 0..epochs {
+            encoder.clear_buffer(
+                &pass.output_weights,
+                8,
+                NonZeroU64::new(pass.output_weights.size() - 8),
+            );
+            let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
+            compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
+            compute_pass.set_bind_group(2, backprop_bind_group, &[]);
+            compute_pass.set_pipeline(&pass.backprop_pipeline);
+            compute_pass.dispatch_workgroups(SIZE / 16, SIZE, 1);
+            compute_pass.set_pipeline(&pass.sum_weights_pipeline);
+            compute_pass.dispatch_workgroups(1, 1, 1);
+            drop(compute_pass);
+            encoder.copy_buffer_to_buffer(
+                &pass.output_weights,
+                8,
+                &matrices_buffer,
+                4 * dims.len() as u64,
+                4 * pass.num_weights as u64,
+            );
+        }
         encoder.copy_buffer_to_buffer(
             &pass.output_weights,
-            0,
+            8,
             &pass.output_weights_copy,
             0,
-            pass.output_weights.size(),
+            4 * pass.num_weights as u64,
         );
     }
     let submission = ctx.queue.submit([encoder.finish()]);
@@ -650,15 +672,12 @@ fn backprop_gpu(
     while let Ok(()) = weights_rx.recv() {
         let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
         let mut cursor = std::io::Cursor::new(weights_slice);
-        cursor.set_position(2 * dims.len() as u64);
-        for _ in 0..pass.weight_multiplicity {
-            for w in weights.iter_mut() {
-                for mut row in w.row_iter_mut() {
-                    for x in row.iter_mut() {
-                        let mut buf = [0u8; 4];
-                        cursor.read(&mut buf[..])?;
-                        *x += f32::from_le_bytes(buf) as f64;
-                    }
+        for w in weights.iter_mut() {
+            for mut row in w.row_iter_mut() {
+                for x in row.iter_mut() {
+                    let mut buf = [0u8; 4];
+                    cursor.read(&mut buf[..])?;
+                    *x = f32::from_le_bytes(buf) as f64;
                 }
             }
         }
@@ -784,6 +803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &mut weights,
                             0.0,
                             0.001,
+                            8,
                             &backprop_bind_group,
                         )?;
                     }

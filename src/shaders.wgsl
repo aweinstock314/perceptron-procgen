@@ -248,3 +248,19 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
         }
     }
 }
+
+@compute @workgroup_size(1)
+fn sum_weights() {
+    for(var i = 0u; i < write_matrices.stride; i++) {
+        let x = atomicLoad(&matrices.weights[i]);
+        let y = atomicLoad(&write_matrices.weights[i]);
+        atomicStore(&write_matrices.weights[i], bitcast<u32>(bitcast<f32>(x) + bitcast<f32>(y)));
+    }
+    for(var k = 1u; k < write_matrices.count; k++) {
+        for(var i = 0u; i < write_matrices.stride; i++) {
+            let x = atomicLoad(&write_matrices.weights[k * write_matrices.stride + i]);
+            let y = atomicLoad(&write_matrices.weights[i]);
+            atomicStore(&write_matrices.weights[i], bitcast<u32>(bitcast<f32>(x) + bitcast<f32>(y)));
+        }
+    }
+}

@@ -1,5 +1,5 @@
 use byteorder::{LittleEndian, WriteBytesExt};
-use clap::{Arg, Command};
+use clap::{value_parser, Arg, Command};
 use image::{ImageFormat, Rgb, RgbImage, RgbaImage};
 use nalgebra::{DMatrix, Dynamic, VecStorage};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -727,7 +727,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subcommand(
             Command::new("backward")
                 .arg(Arg::new("target_image").short('t').required(true))
-                .arg(Arg::new("weights").short('w')),
+                .arg(Arg::new("weights").short('w'))
+                .arg(
+                    Arg::new("epochs_per_batch")
+                        .long("epochs-per-batch")
+                        .value_parser(value_parser!(usize))
+                        .default_value("8"),
+                )
+                .arg(
+                    Arg::new("epochs")
+                        .short('e')
+                        .value_parser(value_parser!(usize))
+                        .default_value("4000"),
+                ),
         );
     let command_help = command.render_help();
     let matches = command.get_matches();
@@ -780,6 +792,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(("backward", matches)) => {
+            let epochs_per_batch = matches.get_one::<usize>("epochs_per_batch").unwrap();
+            let epochs = matches.get_one::<usize>("epochs").unwrap();
             let mut weights = if let Some(weights_json) = matches.get_one::<String>("weights") {
                 let data = serde_json::from_str::<Vec<Vec<f64>>>(&weights_json)?;
                 let mut weights = Vec::new();
@@ -804,7 +818,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fw_pass = ForwardPass::new(&ctx);
             let bk_pass = BackwardPass::new(&ctx, &dims, 64)?;
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
-            for i in 0..500 {
+            for i in 0..epochs / epochs_per_batch {
                 let pre = Instant::now();
                 match backend {
                     Backend::Cpu => {
@@ -818,7 +832,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &mut weights,
                             0.0,
                             0.001,
-                            8,
+                            *epochs_per_batch,
                             &backprop_bind_group,
                         )?;
                     }

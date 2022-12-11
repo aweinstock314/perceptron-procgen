@@ -1,6 +1,7 @@
 // TODO: override expressions (https://github.com/gfx-rs/wgpu/issues/1762)
 let NUM_LAYERS: u32 = 4u;
-let IMAGE_SIZE: f32 = 512.0;
+let FORWARD_IMAGE_SIZE: f32 = 512.0;
+let BACKWARD_IMAGE_SIZE: f32 = 128.0;
 let IMAGE_SCALE: f32 = 8.0;
 //let IMAGE_SCALE: f32 = 32.0;
 let POLYNOMIAL_FEATURES: bool = true;
@@ -162,8 +163,8 @@ fn frobenius(m: u32, n: u32, offset: u32) -> f32 {
 
 @fragment
 fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let u: f32 = IMAGE_SCALE * ((position.x / IMAGE_SIZE) - 0.5);
-    let v: f32 = IMAGE_SCALE * ((position.y / IMAGE_SIZE) - 0.5);
+    let u: f32 = IMAGE_SCALE * ((position.x / FORWARD_IMAGE_SIZE) - 0.5);
+    let v: f32 = IMAGE_SCALE * ((position.y / FORWARD_IMAGE_SIZE) - 0.5);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     var tmp: array<vec4<f32>, MAX_DIM_QUARTER>;
@@ -200,9 +201,9 @@ fn calc_norms() {
 
 @compute @workgroup_size(16)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
-    let alpha = 0.001 / IMAGE_SIZE;
+    let alpha = 0.001 / BACKWARD_IMAGE_SIZE;
     let lambda = 0.001;
-    let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / IMAGE_SIZE) - 0.5);
+    let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / BACKWARD_IMAGE_SIZE) - 0.5);
     let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
     let u = position.x;
     let v = position.y;
@@ -218,7 +219,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     }
     var bk: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     var fw_prime: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
-    let pixel = target_image[global_invocation_id.y * u32(IMAGE_SIZE) + global_invocation_id.x];
+    let pixel = target_image[global_invocation_id.y * u32(BACKWARD_IMAGE_SIZE) + global_invocation_id.x];
     bk[0] = vec4(pixel[0], pixel[1], pixel[2], 0.0);
     let sz = matrices.dims[0];
     for(var i = 0u; i < sz/4u; i++) {

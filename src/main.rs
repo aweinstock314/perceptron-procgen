@@ -27,7 +27,8 @@ use wgpu::{
     VertexBufferLayout, VertexState, VertexStepMode,
 };
 
-const SIZE: u32 = 512;
+const FORWARD_SIZE: u32 = 512;
+const BACKWARD_SIZE: u32 = 128;
 const FRAMES: usize = 1000;
 const FRAMES_UNIT: usize = 100;
 
@@ -49,11 +50,11 @@ fn gen_weights(seed: u64, dims: &[usize]) -> Vec<DMatrix<f64>> {
 fn sample(weights: &[DMatrix<f64>], frames: usize) -> Vec<RgbImage> {
     let mut imgs = Vec::new();
     for ti in 0..frames {
-        let mut img = RgbImage::new(SIZE, SIZE);
-        for yi in 0..SIZE {
-            for xi in 0..SIZE {
-                let x = 8.0 * (xi as f64 - (SIZE / 2) as f64) / SIZE as f64;
-                let y = 8.0 * (yi as f64 - (SIZE / 2) as f64) / SIZE as f64;
+        let mut img = RgbImage::new(FORWARD_SIZE, FORWARD_SIZE);
+        for yi in 0..FORWARD_SIZE {
+            for xi in 0..FORWARD_SIZE {
+                let x = 8.0 * (xi as f64 - (FORWARD_SIZE / 2) as f64) / FORWARD_SIZE as f64;
+                let y = 8.0 * (yi as f64 - (FORWARD_SIZE / 2) as f64) / FORWARD_SIZE as f64;
                 let t = 10.0 * ti as f64 / FRAMES_UNIT as f64;
                 let mut tmp = DMatrix::from_iterator(
                     1,
@@ -103,10 +104,10 @@ fn sample(weights: &[DMatrix<f64>], frames: usize) -> Vec<RgbImage> {
 
 fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbImage) {
     let mut weights_copy: Vec<DMatrix<f64>> = weights.iter().cloned().collect();
-    for yi in 0..SIZE {
-        for xi in 0..SIZE {
-            let x = 8.0 * (xi as f64 - (SIZE / 2) as f64) / SIZE as f64;
-            let y = 8.0 * (yi as f64 - (SIZE / 2) as f64) / SIZE as f64;
+    for yi in 0..BACKWARD_SIZE {
+        for xi in 0..BACKWARD_SIZE {
+            let x = 8.0 * (xi as f64 - (BACKWARD_SIZE / 2) as f64) / BACKWARD_SIZE as f64;
+            let y = 8.0 * (yi as f64 - (BACKWARD_SIZE / 2) as f64) / BACKWARD_SIZE as f64;
             let mut intermediates = Vec::new();
             let mut fw = DMatrix::from_iterator(
                 1,
@@ -357,13 +358,13 @@ impl ForwardPass {
         });
         let texture_buffer = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (4 * SIZE * SIZE) as u64,
+            size: (4 * FORWARD_SIZE * FORWARD_SIZE) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let size_extent = Extent3d {
-            width: SIZE,
-            height: SIZE,
+            width: FORWARD_SIZE,
+            height: FORWARD_SIZE,
             depth_or_array_layers: 1,
         };
         let texture = ctx.device.create_texture(&TextureDescriptor {
@@ -393,7 +394,7 @@ impl BackwardPass {
         dims: &[usize],
         weight_multiplicity: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let image_bytes = 4 * 4 * SIZE as u64 * SIZE as u64;
+        let image_bytes = 4 * 4 * BACKWARD_SIZE as u64 * BACKWARD_SIZE as u64;
         let weights_offset = 2 * 4 + 4 * dims.len() as u64;
         let backprop_bind_group_layout =
             ctx.device
@@ -499,8 +500,8 @@ impl BackwardPass {
         target_image: &RgbImage,
     ) -> Result<BindGroup, Box<dyn std::error::Error>> {
         let mut image_buffer_contents = Vec::new();
-        for y in 0..SIZE {
-            for x in 0..SIZE {
+        for y in 0..BACKWARD_SIZE {
+            for x in 0..BACKWARD_SIZE {
                 let pixel = target_image.get_pixel(x, y);
                 let r: f32 = 2.0 * (pixel.0[0] as f32 / 255.0) - 1.0;
                 let g: f32 = 2.0 * (pixel.0[1] as f32 / 255.0) - 1.0;
@@ -581,8 +582,8 @@ fn sample_gpu(
                     buffer: &pass.texture_buffer,
                     layout: ImageDataLayout {
                         offset: 0,
-                        bytes_per_row: NonZeroU32::new(4 * SIZE),
-                        rows_per_image: NonZeroU32::new(SIZE),
+                        bytes_per_row: NonZeroU32::new(4 * FORWARD_SIZE),
+                        rows_per_image: NonZeroU32::new(FORWARD_SIZE),
                     },
                 },
                 pass.size_extent,
@@ -608,7 +609,7 @@ fn sample_gpu(
                     .copied(),
             );
             pass.texture_buffer.unmap();
-            let image = RgbaImage::from_raw(SIZE, SIZE, image_bytes).unwrap();
+            let image = RgbaImage::from_raw(FORWARD_SIZE, FORWARD_SIZE, image_bytes).unwrap();
             images.push(image);
         }
         scalar_buffer.destroy();
@@ -653,7 +654,7 @@ fn backprop_gpu(
             compute_pass.set_pipeline(&pass.calc_norms_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
             compute_pass.set_pipeline(&pass.backprop_pipeline);
-            compute_pass.dispatch_workgroups(SIZE / 16, SIZE, 1);
+            compute_pass.dispatch_workgroups(BACKWARD_SIZE / 16, BACKWARD_SIZE, 1);
             compute_pass.set_pipeline(&pass.sum_weights_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
             drop(compute_pass);
@@ -824,7 +825,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pre = Instant::now();
                 match backend {
                     Backend::Cpu => {
-                        backprop_cpu(&mut weights, 0.0, 0.001 / SIZE as f64, &target_image);
+                        backprop_cpu(
+                            &mut weights,
+                            0.0,
+                            0.001 / BACKWARD_SIZE as f64,
+                            &target_image,
+                        );
                     }
                     Backend::Gpu => {
                         backprop_gpu(

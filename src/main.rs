@@ -751,6 +751,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .value_parser(value_parser!(usize))
                         .default_value("4000"),
                 ),
+        )
+        .subcommand(
+            Command::new("infer_params").arg(Arg::new("target_image").short('t').required(true)),
         );
     let command_help = command.render_help();
     let matches = command.get_matches();
@@ -869,6 +872,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let imgs = sample_gpu(&ctx, &fw_pass, &dims, &weights, 1)?;
                 imgs[0].save(&format!("backprop_imgs/backprop_{:05}.png", i))?;
+            }
+        }
+        Some(("infer_params", matches)) => {
+            let weights = gen_weights(0, &dims);
+            let target_image_path =
+                PathBuf::from(matches.get_one::<String>("target_image").unwrap());
+            let file = File::open(&target_image_path)?;
+            let reader = BufReader::new(file);
+            let target_image =
+                image::load(reader, ImageFormat::from_path(&target_image_path).unwrap())?;
+            let target_image = target_image.to_rgb8();
+            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
+            for target_size in [16, 32, 64, 128, 256, 512].iter() {
+                for epochs_per_batch in [1, 2, 4, 8, 16].iter() {
+                    let target_image = image::imageops::resize(
+                        &target_image,
+                        *target_size,
+                        *target_size,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    let bk_pass = BackwardPass::new(&ctx, &dims, target_image.dimensions(), 64)?;
+                    let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
+                    let mut weights = weights.clone();
+                    let pre = Instant::now();
+                    backprop_gpu(
+                        &ctx,
+                        &bk_pass,
+                        &dims,
+                        &mut weights,
+                        0.0,
+                        0.001,
+                        *epochs_per_batch,
+                        &backprop_bind_group,
+                    )?;
+                    let post = Instant::now();
+                    let duration = post.duration_since(pre);
+                    println!(
+                        "backprop pass {}x{}, {} epb {} seconds ({} per epoch)",
+                        target_size,
+                        target_size,
+                        epochs_per_batch,
+                        duration.as_secs_f32(),
+                        duration.as_secs_f32() / *epochs_per_batch as f32
+                    );
+                }
+                println!("-----");
             }
         }
         _ => {

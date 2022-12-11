@@ -187,9 +187,11 @@ struct ForwardPass {
 }
 
 struct BackwardPass {
+    calc_norms_pipeline: ComputePipeline,
     backprop_pipeline: ComputePipeline,
     sum_weights_pipeline: ComputePipeline,
     num_weights: usize,
+    weights_offset: u64,
     weights_size: u64,
     weight_multiplicity: u64,
     output_weights: Buffer,
@@ -392,6 +394,7 @@ impl BackwardPass {
         weight_multiplicity: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let image_bytes = 4 * 4 * SIZE as u64 * SIZE as u64;
+        let weights_offset = 2 * 4 + 4 * dims.len() as u64;
         let backprop_bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -403,7 +406,7 @@ impl BackwardPass {
                             ty: BindingType::Buffer {
                                 ty: BufferBindingType::Storage { read_only: false },
                                 has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(2 * 4 + 4),
+                                min_binding_size: NonZeroU64::new(weights_offset + 4),
                             },
                             count: None,
                         },
@@ -446,11 +449,19 @@ impl BackwardPass {
                 module: &ctx.shaders,
                 entry_point: &"sum_weights",
             });
+        let calc_norms_pipeline = ctx
+            .device
+            .create_compute_pipeline(&ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &ctx.shaders,
+                entry_point: &"calc_norms",
+            });
         let mut num_weights = 0;
         for (i, j) in dims.iter().zip(dims[1..].iter()) {
             num_weights += *i * *j;
         }
-        let weights_size = 2 * 4 + weight_multiplicity as u64 * 4 * num_weights as u64;
+        let weights_size = weights_offset + weight_multiplicity as u64 * 4 * num_weights as u64;
         let output_weights = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
             size: weights_size,
@@ -470,9 +481,11 @@ impl BackwardPass {
             mapped_at_creation: false,
         });
         Ok(Self {
+            calc_norms_pipeline,
             backprop_pipeline,
             sum_weights_pipeline,
             num_weights,
+            weights_offset,
             weights_size,
             weight_multiplicity,
             output_weights,
@@ -630,13 +643,15 @@ fn backprop_gpu(
         for _ in 0..epochs {
             encoder.clear_buffer(
                 &pass.output_weights,
-                8,
-                NonZeroU64::new(pass.output_weights.size() - 8),
+                pass.weights_offset,
+                NonZeroU64::new(pass.output_weights.size() - pass.weights_offset),
             );
             let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
             compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
             compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
             compute_pass.set_bind_group(2, backprop_bind_group, &[]);
+            compute_pass.set_pipeline(&pass.calc_norms_pipeline);
+            compute_pass.dispatch_workgroups(1, 1, 1);
             compute_pass.set_pipeline(&pass.backprop_pipeline);
             compute_pass.dispatch_workgroups(SIZE / 16, SIZE, 1);
             compute_pass.set_pipeline(&pass.sum_weights_pipeline);
@@ -644,7 +659,7 @@ fn backprop_gpu(
             drop(compute_pass);
             encoder.copy_buffer_to_buffer(
                 &pass.output_weights,
-                8,
+                pass.weights_offset,
                 &matrices_buffer,
                 4 * dims.len() as u64,
                 4 * pass.num_weights as u64,
@@ -652,7 +667,7 @@ fn backprop_gpu(
         }
         encoder.copy_buffer_to_buffer(
             &pass.output_weights,
-            8,
+            pass.weights_offset,
             &pass.output_weights_copy,
             0,
             4 * pass.num_weights as u64,

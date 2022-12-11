@@ -28,7 +28,6 @@ use wgpu::{
 };
 
 const FORWARD_SIZE: u32 = 512;
-const BACKWARD_SIZE: u32 = 128;
 const FRAMES: usize = 1000;
 const FRAMES_UNIT: usize = 100;
 
@@ -104,10 +103,11 @@ fn sample(weights: &[DMatrix<f64>], frames: usize) -> Vec<RgbImage> {
 
 fn backprop_cpu(weights: &mut [DMatrix<f64>], t: f64, alpha: f64, target: &RgbImage) {
     let mut weights_copy: Vec<DMatrix<f64>> = weights.iter().cloned().collect();
-    for yi in 0..BACKWARD_SIZE {
-        for xi in 0..BACKWARD_SIZE {
-            let x = 8.0 * (xi as f64 - (BACKWARD_SIZE / 2) as f64) / BACKWARD_SIZE as f64;
-            let y = 8.0 * (yi as f64 - (BACKWARD_SIZE / 2) as f64) / BACKWARD_SIZE as f64;
+    let (width, height) = target.dimensions();
+    for yi in 0..height {
+        for xi in 0..width {
+            let x = 8.0 * (xi as f64 - (width / 2) as f64) / width as f64;
+            let y = 8.0 * (yi as f64 - (height / 2) as f64) / height as f64;
             let mut intermediates = Vec::new();
             let mut fw = DMatrix::from_iterator(
                 1,
@@ -198,6 +198,7 @@ struct BackwardPass {
     output_weights: Buffer,
     output_weights_copy: Buffer,
     backprop_bind_group_layout: BindGroupLayout,
+    target_dims: (u32, u32),
 }
 
 impl GPUContext {
@@ -243,7 +244,7 @@ impl GPUContext {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(4),
+                        min_binding_size: NonZeroU64::new(12),
                     },
                     count: None,
                 }],
@@ -289,9 +290,15 @@ impl GPUContext {
         });
         Ok((matrices_buffer, matrices_bind_group))
     }
-    fn scalar_bind_group(&self, t: f32) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
+    fn scalar_bind_group(
+        &self,
+        t: f32,
+        image_dims: (u32, u32),
+    ) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
         let mut scalar_buffer_contents = Vec::new();
         scalar_buffer_contents.write(&t.to_le_bytes())?;
+        scalar_buffer_contents.write_u32::<LittleEndian>(image_dims.0)?;
+        scalar_buffer_contents.write_u32::<LittleEndian>(image_dims.1)?;
         let scalar_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
             label: None,
             contents: &scalar_buffer_contents,
@@ -392,9 +399,10 @@ impl BackwardPass {
     fn new(
         ctx: &GPUContext,
         dims: &[usize],
+        target_dims: (u32, u32),
         weight_multiplicity: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let image_bytes = 4 * 4 * BACKWARD_SIZE as u64 * BACKWARD_SIZE as u64;
+        let image_bytes = 4 * 4 * target_dims.0 as u64 * target_dims.1 as u64;
         let weights_offset = 2 * 4 + 4 * dims.len() as u64;
         let backprop_bind_group_layout =
             ctx.device
@@ -492,6 +500,7 @@ impl BackwardPass {
             output_weights,
             output_weights_copy,
             backprop_bind_group_layout,
+            target_dims,
         })
     }
     fn backprop_bind_group(
@@ -500,8 +509,8 @@ impl BackwardPass {
         target_image: &RgbImage,
     ) -> Result<BindGroup, Box<dyn std::error::Error>> {
         let mut image_buffer_contents = Vec::new();
-        for y in 0..BACKWARD_SIZE {
-            for x in 0..BACKWARD_SIZE {
+        for y in 0..self.target_dims.1 {
+            for x in 0..self.target_dims.0 {
                 let pixel = target_image.get_pixel(x, y);
                 let r: f32 = 2.0 * (pixel.0[0] as f32 / 255.0) - 1.0;
                 let g: f32 = 2.0 * (pixel.0[1] as f32 / 255.0) - 1.0;
@@ -551,7 +560,8 @@ fn sample_gpu(
     let mut images = Vec::new();
     for ti in 0..frames {
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
-        let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t)?;
+        let (scalar_buffer, scalar_bind_group) =
+            ctx.scalar_bind_group(t, (FORWARD_SIZE, FORWARD_SIZE))?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -629,7 +639,7 @@ fn backprop_gpu(
     backprop_bind_group: &BindGroup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
-    let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t)?;
+    let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, pass.target_dims)?;
     let mut encoder = ctx
         .device
         .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -654,7 +664,7 @@ fn backprop_gpu(
             compute_pass.set_pipeline(&pass.calc_norms_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
             compute_pass.set_pipeline(&pass.backprop_pipeline);
-            compute_pass.dispatch_workgroups(BACKWARD_SIZE / 16, BACKWARD_SIZE, 1);
+            compute_pass.dispatch_workgroups(pass.target_dims.0 / 16, pass.target_dims.1, 1);
             compute_pass.set_pipeline(&pass.sum_weights_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
             drop(compute_pass);
@@ -817,7 +827,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let target_image = target_image.to_rgb8();
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
             let fw_pass = ForwardPass::new(&ctx);
-            let bk_pass = BackwardPass::new(&ctx, &dims, 64)?;
+            let bk_pass = BackwardPass::new(&ctx, &dims, target_image.dimensions(), 64)?;
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
             std::fs::create_dir_all("backprop_imgs")?;
             std::fs::create_dir_all("weights")?;
@@ -828,7 +838,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         backprop_cpu(
                             &mut weights,
                             0.0,
-                            0.001 / BACKWARD_SIZE as f64,
+                            0.001 / ((bk_pass.target_dims.0 * bk_pass.target_dims.1) as f64).sqrt(),
                             &target_image,
                         );
                     }

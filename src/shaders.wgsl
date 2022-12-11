@@ -1,7 +1,6 @@
 // TODO: override expressions (https://github.com/gfx-rs/wgpu/issues/1762)
 let NUM_LAYERS: u32 = 4u;
 let FORWARD_IMAGE_SIZE: f32 = 512.0;
-let BACKWARD_IMAGE_SIZE: f32 = 128.0;
 let IMAGE_SCALE: f32 = 8.0;
 //let IMAGE_SCALE: f32 = 32.0;
 let POLYNOMIAL_FEATURES: bool = true;
@@ -13,6 +12,12 @@ struct Matrices {
     weights: array<atomic<u32>>,
 }
 
+struct ScalarParams {
+    time: f32,
+    image_width: u32,
+    image_height: u32,
+}
+
 struct MatrixDeltas {
     stride: u32,
     count: u32,
@@ -21,7 +26,7 @@ struct MatrixDeltas {
 }
 
 @group(0) @binding(0) var<storage, read> matrices: Matrices;
-@group(1) @binding(0) var<uniform> time: f32;
+@group(1) @binding(0) var<uniform> scalars: ScalarParams;
 
 @group(2) @binding(0) var<storage, read_write> write_matrices: MatrixDeltas;
 @group(2) @binding(1) var<storage, read> target_image: array<vec3<f32>, 262144>;
@@ -165,13 +170,13 @@ fn frobenius(m: u32, n: u32, offset: u32) -> f32 {
 fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let u: f32 = IMAGE_SCALE * ((position.x / FORWARD_IMAGE_SIZE) - 0.5);
     let v: f32 = IMAGE_SCALE * ((position.y / FORWARD_IMAGE_SIZE) - 0.5);
-    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
-    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     var tmp: array<vec4<f32>, MAX_DIM_QUARTER>;
     if POLYNOMIAL_FEATURES {
-        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
     } else {
-        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(cos(u), cos(v), 0.0, 0.0), vec4<f32>(), vec4<f32>());
+        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(cos(u), cos(v), 0.0, 0.0), vec4<f32>(), vec4<f32>());
     }
     var offset: u32 = 0u;
     for(var matrix_index: u32 = 0u; matrix_index < (NUM_LAYERS - 1u); matrix_index++) {
@@ -201,15 +206,15 @@ fn calc_norms() {
 
 @compute @workgroup_size(16)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
-    let alpha = 0.001 / BACKWARD_IMAGE_SIZE;
+    let alpha = 0.001 / sqrt(f32(scalars.image_width) * f32(scalars.image_height));
     let lambda = 0.001;
-    let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / BACKWARD_IMAGE_SIZE) - 0.5);
+    let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / vec3<f32>(f32(scalars.image_width), f32(scalars.image_height), 1.0)) - 0.5);
     let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
     let u = position.x;
     let v = position.y;
     var fw: array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS> = array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS>();
-    //fw[0] = array<f32, MAX_DIM>(time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
-    fw[0] = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+    //fw[0] = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
+    fw[0] = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
     var offset: u32 = 0u;
     for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
         let m: u32 = matrices.dims[i];
@@ -219,7 +224,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     }
     var bk: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     var fw_prime: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
-    let pixel = target_image[global_invocation_id.y * u32(BACKWARD_IMAGE_SIZE) + global_invocation_id.x];
+    let pixel = target_image[global_invocation_id.y * scalars.image_width + global_invocation_id.x];
     bk[0] = vec4(pixel[0], pixel[1], pixel[2], 0.0);
     let sz = matrices.dims[0];
     for(var i = 0u; i < sz/4u; i++) {

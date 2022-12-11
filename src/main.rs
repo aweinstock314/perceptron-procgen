@@ -818,6 +818,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fw_pass = ForwardPass::new(&ctx);
             let bk_pass = BackwardPass::new(&ctx, &dims, 64)?;
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
+            std::fs::create_dir_all("backprop_imgs")?;
+            std::fs::create_dir_all("weights")?;
             for i in 0..epochs / epochs_per_batch {
                 let pre = Instant::now();
                 match backend {
@@ -840,15 +842,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let post = Instant::now();
                 let duration = post.duration_since(pre);
                 println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
-                let serialized_weights = serde_json::to_string(
-                    &weights
-                        .iter()
-                        .map(|w| w.data.as_vec().clone())
-                        .collect::<Vec<Vec<f64>>>(),
-                )?;
-                println!("{}", serialized_weights);
+                if let Ok(mut f) = File::create(format!("weights/checkpoint_{:05}.json", i)) {
+                    let serialized_weights = serde_json::to_string(
+                        &weights
+                            .iter()
+                            .map(|w| w.data.as_vec().clone())
+                            .collect::<Vec<Vec<f64>>>(),
+                    )?;
+                    writeln!(f, "{}", serialized_weights)?;
+                }
                 let imgs = sample_gpu(&ctx, &fw_pass, &dims, &weights, 1)?;
-                imgs[0].save(&format!("backprop_{:02}.png", i))?;
+                imgs[0].save(&format!("backprop_imgs/backprop_{:05}.png", i))?;
             }
         }
         _ => {

@@ -1,7 +1,7 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use clap::{value_parser, Arg, Command};
 use image::{ImageFormat, Rgb, RgbImage, RgbaImage};
-use nalgebra::{DMatrix, Dynamic, VecStorage};
+use nalgebra::{DMatrix, Dynamic, VecStorage, Vector3};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     borrow::Cow,
@@ -27,6 +27,7 @@ use wgpu::{
     VertexBufferLayout, VertexState, VertexStepMode,
 };
 
+const VARIABLE_LEARNING_RATE: bool = false;
 const FORWARD_SIZE: u32 = 512;
 const FRAMES: usize = 1000;
 const FRAMES_UNIT: usize = 100;
@@ -185,6 +186,7 @@ struct ForwardPass {
     texture: Texture,
     texture_view: TextureView,
     texture_buffer: Buffer,
+    target_dims: (u32, u32),
 }
 
 struct BackwardPass {
@@ -244,7 +246,7 @@ impl GPUContext {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(12),
+                        min_binding_size: NonZeroU64::new(16),
                     },
                     count: None,
                 }],
@@ -294,11 +296,13 @@ impl GPUContext {
         &self,
         t: f32,
         image_dims: (u32, u32),
+        alpha: f32,
     ) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
         let mut scalar_buffer_contents = Vec::new();
         scalar_buffer_contents.write(&t.to_le_bytes())?;
         scalar_buffer_contents.write_u32::<LittleEndian>(image_dims.0)?;
         scalar_buffer_contents.write_u32::<LittleEndian>(image_dims.1)?;
+        scalar_buffer_contents.write(&alpha.to_le_bytes())?;
         let scalar_buffer = self.device.create_buffer_init(&BufferInitDescriptor {
             label: None,
             contents: &scalar_buffer_contents,
@@ -317,7 +321,7 @@ impl GPUContext {
 }
 
 impl ForwardPass {
-    fn new(ctx: &GPUContext) -> Self {
+    fn new(ctx: &GPUContext, target_dims: (u32, u32)) -> Self {
         let pipeline_layout = ctx
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -365,13 +369,13 @@ impl ForwardPass {
         });
         let texture_buffer = ctx.device.create_buffer(&BufferDescriptor {
             label: None,
-            size: (4 * FORWARD_SIZE * FORWARD_SIZE) as u64,
+            size: 4 * target_dims.0 as u64 * target_dims.1 as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let size_extent = Extent3d {
-            width: FORWARD_SIZE,
-            height: FORWARD_SIZE,
+            width: target_dims.0,
+            height: target_dims.1,
             depth_or_array_layers: 1,
         };
         let texture = ctx.device.create_texture(&TextureDescriptor {
@@ -391,6 +395,7 @@ impl ForwardPass {
             texture,
             texture_view,
             texture_buffer,
+            target_dims,
         }
     }
 }
@@ -560,8 +565,7 @@ fn sample_gpu(
     let mut images = Vec::new();
     for ti in 0..frames {
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
-        let (scalar_buffer, scalar_bind_group) =
-            ctx.scalar_bind_group(t, (FORWARD_SIZE, FORWARD_SIZE))?;
+        let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, pass.target_dims, 0.0)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -592,8 +596,8 @@ fn sample_gpu(
                     buffer: &pass.texture_buffer,
                     layout: ImageDataLayout {
                         offset: 0,
-                        bytes_per_row: NonZeroU32::new(4 * FORWARD_SIZE),
-                        rows_per_image: NonZeroU32::new(FORWARD_SIZE),
+                        bytes_per_row: NonZeroU32::new(4 * pass.target_dims.0),
+                        rows_per_image: NonZeroU32::new(pass.target_dims.1),
                     },
                 },
                 pass.size_extent,
@@ -619,7 +623,8 @@ fn sample_gpu(
                     .copied(),
             );
             pass.texture_buffer.unmap();
-            let image = RgbaImage::from_raw(FORWARD_SIZE, FORWARD_SIZE, image_bytes).unwrap();
+            let image =
+                RgbaImage::from_raw(pass.target_dims.0, pass.target_dims.1, image_bytes).unwrap();
             images.push(image);
         }
         scalar_buffer.destroy();
@@ -634,12 +639,12 @@ fn backprop_gpu(
     dims: &[usize],
     weights: &mut [DMatrix<f64>],
     t: f32,
-    alpha: f64,
+    alpha: f32,
     epochs: usize,
     backprop_bind_group: &BindGroup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
-    let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, pass.target_dims)?;
+    let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, pass.target_dims, alpha)?;
     let mut encoder = ctx
         .device
         .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -770,7 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match matches.subcommand() {
         Some(("forward", matches)) => {
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
-            let pass = ForwardPass::new(&ctx);
+            let pass = ForwardPass::new(&ctx, (FORWARD_SIZE, FORWARD_SIZE));
             for seed in 0..3 {
                 let weights = gen_weights(seed, &dims);
                 match backend {
@@ -829,11 +834,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image::load(reader, ImageFormat::from_path(&target_image_path).unwrap())?;
             let target_image = target_image.to_rgb8();
             let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
-            let fw_pass = ForwardPass::new(&ctx);
+            let fw_pass = ForwardPass::new(&ctx, (FORWARD_SIZE, FORWARD_SIZE));
+            let fw_pass2 = ForwardPass::new(&ctx, target_image.dimensions());
             let bk_pass = BackwardPass::new(&ctx, &dims, target_image.dimensions(), 64)?;
             let backprop_bind_group = bk_pass.backprop_bind_group(&ctx, &target_image)?;
             std::fs::create_dir_all("backprop_imgs")?;
             std::fs::create_dir_all("weights")?;
+            let mut alpha = 0.001;
+            let mut prev_error = std::f32::INFINITY;
             for i in 0..epochs / epochs_per_batch {
                 let pre = Instant::now();
                 match backend {
@@ -841,7 +849,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         backprop_cpu(
                             &mut weights,
                             0.0,
-                            0.001 / ((bk_pass.target_dims.0 * bk_pass.target_dims.1) as f64).sqrt(),
+                            alpha / ((bk_pass.target_dims.0 * bk_pass.target_dims.1) as f64).sqrt(),
                             &target_image,
                         );
                     }
@@ -852,7 +860,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &dims,
                             &mut weights,
                             0.0,
-                            0.001,
+                            alpha as f32,
                             *epochs_per_batch,
                             &backprop_bind_group,
                         )?;
@@ -860,7 +868,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let post = Instant::now();
                 let duration = post.duration_since(pre);
-                println!("backprop pass {}, {} seconds", i, duration.as_secs_f32());
                 if let Ok(mut f) = File::create(format!("weights/checkpoint_{:05}.json", i)) {
                     let serialized_weights = serde_json::to_string(
                         &weights
@@ -869,6 +876,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .collect::<Vec<Vec<f64>>>(),
                     )?;
                     writeln!(f, "{}", serialized_weights)?;
+                }
+                let imgs = sample_gpu(&ctx, &fw_pass2, &dims, &weights, 1)?;
+                let mut error = 0.0;
+                for yi in 0..bk_pass.target_dims.1 {
+                    for xi in 0..bk_pass.target_dims.0 {
+                        let a = imgs[0].get_pixel(xi, yi);
+                        let a = 2.0
+                            * (Vector3::new(a.0[0] as f32, a.0[1] as f32, a.0[2] as f32) / 255.0)
+                                .add_scalar(-1.0);
+                        let b = target_image.get_pixel(xi, yi);
+                        let b = 2.0
+                            * (Vector3::new(b.0[0] as f32, b.0[1] as f32, b.0[2] as f32) / 255.0)
+                                .add_scalar(-1.0);
+                        error += (b - &a).norm();
+                    }
+                }
+                println!(
+                    "backprop pass {}, {} seconds, {} error, {} alpha",
+                    i,
+                    duration.as_secs_f32(),
+                    error,
+                    alpha
+                );
+                if VARIABLE_LEARNING_RATE {
+                    if error > 1.02 * prev_error {
+                        alpha *= 0.99;
+                        prev_error = error;
+                    }
+                    prev_error = prev_error.min(error);
                 }
                 let imgs = sample_gpu(&ctx, &fw_pass, &dims, &weights, 1)?;
                 imgs[0].save(&format!("backprop_imgs/backprop_{:05}.png", i))?;

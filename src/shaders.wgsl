@@ -16,6 +16,7 @@ struct ScalarParams {
     time: f32,
     image_width: u32,
     image_height: u32,
+    alpha: f32,
 }
 
 struct MatrixDeltas {
@@ -206,7 +207,7 @@ fn calc_norms() {
 
 @compute @workgroup_size(16)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
-    let alpha = 0.001 / sqrt(f32(scalars.image_width) * f32(scalars.image_height));
+    let alpha = scalars.alpha / sqrt(f32(scalars.image_width) * f32(scalars.image_height));
     let lambda = 0.001;
     let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / vec3<f32>(f32(scalars.image_width), f32(scalars.image_height), 1.0)) - 0.5);
     let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;

@@ -97,11 +97,8 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
     var y = x;
     let m = min(MAX_DIM, m);
     for(var j: u32 = 0u; j < n/4u; j++) {
-        //let nn = min(4u, n - 4u*j);
         for(var k: u32 = 0u; k < m/4u; k++) {
-            //let mm = min(4u, m - 4u*k);
             var z = mat4x4<f32>();
-            // if we used nn/mm directly here, we'd get a slowdown relative to the unvectorized version due to excessive branching
             for(var i=0u; i<4u; i++) {
                 for(var l=0u; l<4u; l++) {
                     z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
@@ -109,46 +106,21 @@ fn do_mm4(x: array<vec4<f32>, MAX_DIM_QUARTER>, m: u32, n: u32, offset: u32) -> 
             }
             out[j] += z * y[k];
         }
-    }
-    // handle the remainder if the matrix size isn't a multiple of 4
-    if(n % 4u != 0u) {
-        let j = n/4u;
-        let nn = min(4u, n - 4u*j);
-        for(var k: u32 = 0u; k < m/4u; k++) {
-            var z = mat4x4<f32>();
-            for(var i=0u; i<nn; i++) {
-                for(var l=0u; l<4u; l++) {
-                    z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
-                }
-            }
-            out[j] += z * y[k];
-        }
-    }
-    if(m % 4u != 0u) {
-        let k = m/4u;
-        let mm = min(4u, m - 4u*k);
-        for(var j: u32 = 0u; j < n/4u; j++) {
-            var z = mat4x4<f32>();
+        for(var k: u32 = 0u; k < m%4u; k++) {
             for(var i=0u; i<4u; i++) {
-                for(var l=0u; l<mm; l++) {
-                    z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
-                }
+                out[j][i] += bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*(m/4u)+k) * n])) * y[m/4u][k];
             }
-            out[j] += z * y[k];
         }
     }
-    if(n % 4u != 0u && m % 4u != 0u) {
-        let j = n/4u;
-        let k = m/4u;
-        let nn = min(4u, n - 4u*j);
-        let mm = min(4u, m - 4u*k);
-        var z = mat4x4<f32>();
-        for(var i=0u; i<nn; i++) {
-            for(var l=0u; l<mm; l++) {
-                z[l][i] = bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*j+i) + (4u*k+l) * n]));
+    for(var j: u32 = 0u; j < n%4u; j++) {
+        for(var k: u32 = 0u; k < m/4u; k++) {
+            for(var l=0u; l<4u; l++) {
+                out[n/4u][j] += bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*(n/4u)+j) + (4u*k+l) * n])) * y[k][l];
             }
         }
-        out[j] += z * y[k];
+        for(var k: u32 = 0u; k < m%4u; k++) {
+            out[n/4u][j] += bitcast<f32>(atomicLoad(&matrices.weights[offset + (4u*(n/4u)+j) + (4u*(m/4u)+k) * n])) * y[m/4u][k];
+        }
     }
     for(var k: u32 = 0u; k < MAX_DIM_QUARTER; k++) {
         out[k] = tanh(out[k]);

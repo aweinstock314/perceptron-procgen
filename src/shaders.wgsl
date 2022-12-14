@@ -145,16 +145,20 @@ fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let v: f32 = IMAGE_SCALE * ((position.y / FORWARD_IMAGE_SIZE) - 0.5);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    var tmp: array<vec4<f32>, MAX_DIM_QUARTER>;
+    var tmp: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     if POLYNOMIAL_FEATURES {
-        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+        tmp[0] = vec4(1.0, scalars.time, u, v);
+        tmp[1] = vec4(u*u, u*v, v*v, u*u*u);
+        tmp[2] = vec4(u*u*v, u*v*v, v*v*v, 0.0);
     } else {
-        tmp = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(cos(u), cos(v), 0.0, 0.0), vec4<f32>(), vec4<f32>());
+        tmp[0] = vec4(scalars.time, 1.0, u, v);
+        tmp[1] = vec4(cos(u), cos(v), 0.0, 0.0);
     }
     var offset: u32 = 0u;
     for(var matrix_index: u32 = 0u; matrix_index < (NUM_LAYERS - 1u); matrix_index++) {
         let m: u32 = matrices.dims[matrix_index];
         let n: u32 = matrices.dims[matrix_index+1u];
+        tmp[0][0] = 1.0;
         //tmp = do_mm(tmp, m, n, offset);
         tmp = do_mm4(tmp, m, n, offset);
         offset += m * n;
@@ -179,7 +183,7 @@ fn calc_norms() {
 
 @compute @workgroup_size(16)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
-    let alpha = scalars.alpha / sqrt(f32(scalars.image_width) * f32(scalars.image_height));
+    let alpha = scalars.alpha / f32(scalars.image_width) * f32(scalars.image_height);
     let lambda = 0.001;
     let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / vec3<f32>(f32(scalars.image_width), f32(scalars.image_height), 1.0)) - 0.5);
     let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
@@ -187,11 +191,15 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, 
     let v = position.y;
     var fw: array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS> = array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS>();
     //fw[0] = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
-    fw[0] = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+    //fw[0] = array<vec4<f32>, MAX_DIM_QUARTER>(vec4(scalars.time, 1.0, u, v), vec4(u*u, u*v, v*v, u*u*u), vec4(u*u*v, u*v*v, v*v*v, 0.0), vec4<f32>());
+    fw[0][0] = vec4(1.0, scalars.time, u, v);
+    fw[0][1] = vec4(u*u, u*v, v*v, u*u*u);
+    fw[0][2] = vec4(u*u*v, u*v*v, v*v*v, 0.0);
     var offset: u32 = 0u;
     for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
         let m: u32 = matrices.dims[i];
         let n: u32 = matrices.dims[i+1u];
+        fw[i][0][0] = 1.0;
         fw[i+1u] = do_mm4(fw[i], m, n, offset);
         offset += m * n;
     }

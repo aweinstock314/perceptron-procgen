@@ -974,7 +974,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subcommand(
             Command::new("parse_mnist")
                 .arg(Arg::new("labels_file").required(true))
-                .arg(Arg::new("images_file").required(true)),
+                .arg(Arg::new("images_file").required(true))
+                .arg(
+                    Arg::new("save_images")
+                        .value_parser(["true", "false"])
+                        .default_value("false"),
+                ),
         );
     let command_help = command.render_help();
     let matches = command.get_matches();
@@ -986,7 +991,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    let dims =
+    let mut dims =
         serde_json::from_str::<Vec<usize>>(&**matches.get_one::<String>("dimensions").unwrap())?;
 
     match matches.subcommand() {
@@ -1245,6 +1250,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut images_file = File::open(PathBuf::from(
                 matches.get_one::<String>("images_file").unwrap(),
             ))?;
+            let save_images =
+                matches.get_one::<String>("save_images").map(|x| &**x) == Some("true");
             let magic = labels_file.read_u32::<BigEndian>()?;
             let num_labels = labels_file.read_u32::<BigEndian>()?;
             assert_eq!(magic, 0x00000801, "MNIST labels magic mismatch");
@@ -1255,24 +1262,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_labels, num_images,
                 "Inconsistant amount of training points between label and image files."
             );
+            const NUM_POINTS: u32 = 1;
+            let mut target_labels = Dataset::new(10);
             let mut labels: BTreeMap<u32, u8> = BTreeMap::new();
-            for i in 0..num_labels {
-                labels.insert(i, labels_file.read_u8()?);
+            for i in 0..num_labels.min(NUM_POINTS) {
+                let value = labels_file.read_u8()?;
+                labels.insert(i, value);
+                let mut point = [0.0; 10];
+                point[value as usize % 10] = 1.0;
+                target_labels.push(&point);
             }
             let mut labels_json = File::create("mnist_labels.json")?;
             write!(labels_json, "{}", serde_json::to_string(&labels)?)?;
             let width = images_file.read_u32::<BigEndian>()?;
             let height = images_file.read_u32::<BigEndian>()?;
-            std::fs::create_dir_all("mnist_imgs")?;
-            for i in 0..num_images {
-                let mut bytes = Vec::new();
-                for _ in 0..width * height {
-                    bytes.push(255 - images_file.read_u8()?);
-                }
-                let image =
-                    ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(width, height, bytes).unwrap();
-                image.save(format!("mnist_imgs/{:05}.png", i))?;
+            if save_images {
+                std::fs::create_dir_all("mnist_imgs")?;
             }
+            let mut target_points = Dataset::new(width * height);
+            for i in 0..num_images.min(NUM_POINTS) {
+                let mut bytes = Vec::new();
+                let mut point = Vec::new();
+                for _ in 0..width * height {
+                    let value = 255 - images_file.read_u8()?;
+                    bytes.push(value);
+                    point.push(value as f32 / 255.0);
+                }
+                if save_images {
+                    let image =
+                        ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(width, height, bytes).unwrap();
+                    image.save(format!("mnist_imgs/{:05}.png", i))?;
+                }
+                target_points.push(&point);
+            }
+            dims[0] = width as usize * height as usize;
+            let dims_len = dims.len();
+            dims[dims_len - 1] = 10;
+            let mut weights = if let Some(weights_json) = matches.get_one::<String>("weights") {
+                let data = serde_json::from_str::<Vec<Vec<f64>>>(&weights_json)?;
+                let mut weights = Vec::new();
+                for (k, (i, j)) in dims.iter().zip(dims[1..].iter()).enumerate() {
+                    let storage =
+                        VecStorage::new(Dynamic::new(*i), Dynamic::new(*j), data[k].clone());
+                    let w = DMatrix::from_vec_storage(storage);
+                    weights.push(w);
+                }
+                weights
+            } else {
+                gen_weights(0, &dims)
+            };
+            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
+            let bk_pass = BackwardPass::new(&ctx, &dims, 8)?;
+            let (_, backprop_bind_group) =
+                bk_pass.backprop_bind_group(&ctx, &mut target_points, &mut target_labels)?;
+            let pre = Instant::now();
+            backprop_gpu(
+                &ctx,
+                &bk_pass,
+                &dims,
+                &mut weights,
+                target_points.count,
+                0.0,
+                0.001,
+                1,
+                &backprop_bind_group,
+            )?;
+            let post = Instant::now();
+            let duration = post.duration_since(pre);
+            println!("backprop pass {}: {} seconds", 0, duration.as_secs_f32(),);
         }
         _ => {
             println!("{}", command_help);

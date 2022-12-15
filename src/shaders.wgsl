@@ -35,7 +35,7 @@ struct Dataset {
 
 @group(2) @binding(0) var<storage, read_write> write_matrices: MatrixDeltas;
 @group(2) @binding(1) var<storage, read> target_points: Dataset;
-@group(2) @binding(2) var<storage, read> target_labels: Dataset;
+@group(2) @binding(2) var<storage, read_write> target_labels: Dataset;
 
 //var<workgroup> foo: atomic<u32> = atomic<u32>(0u);
 //var<workgroup> foo: u32 = 0u;
@@ -145,8 +145,8 @@ fn frobenius(m: u32, n: u32, offset: u32) -> f32 {
 
 @fragment
 fn frag_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let u: f32 = IMAGE_SCALE * ((position.x / FORWARD_IMAGE_SIZE) - 0.5);
-    let v: f32 = IMAGE_SCALE * ((position.y / FORWARD_IMAGE_SIZE) - 0.5);
+    let u: f32 = IMAGE_SCALE * (((position.x - 0.5) / FORWARD_IMAGE_SIZE) - 0.5);
+    let v: f32 = IMAGE_SCALE * (((position.y - 0.5) / FORWARD_IMAGE_SIZE) - 0.5);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v, 0.0, 0.0, 0.0, 0.0, 0.0);
     //var tmp: array<f32, MAX_DIM> = array<f32, MAX_DIM>(scalars.time, 1.0, u, v, cos(u), cos(v), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     var tmp: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
@@ -186,7 +186,27 @@ fn calc_norms() {
 }
 
 @compute @workgroup_size(16)
-fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>, @builtin(local_invocation_id) local_invocation_id: vec3<u32>) {
+fn forward_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+    var fw: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
+    let dataset_index = global_invocation_id.x;
+    for(var i = 0u; i < target_points.dimension; i++) {
+        fw[i/4u][i%4u] = target_points.data[dataset_index * target_points.dimension + i];
+    }
+    var offset: u32 = 0u;
+    for(var i = 0u; i < (NUM_LAYERS - 1u); i++) {
+        let m: u32 = matrices.dims[i];
+        let n: u32 = matrices.dims[i+1u];
+        fw[0][0] = 1.0;
+        fw = do_mm4(fw, m, n, offset);
+        offset += m * n;
+    }
+    for(var i = 0u; i < target_labels.dimension; i++) {
+        target_labels.data[dataset_index * target_labels.dimension + i] = fw[i/4u][i%4u];
+    }
+}
+
+@compute @workgroup_size(16)
+fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let alpha = scalars.alpha;
     let lambda = 0.001;
     //let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / vec3<f32>(f32(scalars.image_width), f32(scalars.image_height), 1.0)) - 0.5);

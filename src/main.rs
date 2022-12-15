@@ -5,6 +5,7 @@ use image::{
 };
 use nalgebra::{DMatrix, Dynamic, VecStorage, Vector3};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use regex::{NoExpand, Regex};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -304,6 +305,29 @@ impl GPUContext {
         let mut shader_source = String::new();
         let mut shader_source_file = BufReader::new(File::open("src/shaders.wgsl")?);
         shader_source_file.read_to_string(&mut shader_source)?;
+        let mut max_dim = *dims.iter().max().unwrap();
+        max_dim += 4 - max_dim % 4;
+        let num_layers = dims.len();
+        let replacements = [
+            (
+                "let NUM_LAYERS: u32 = \\d+u;",
+                format!("let NUM_LAYERS: u32 = {}u;", num_layers),
+            ),
+            (
+                "let MAX_DIM: u32 = \\d+u;",
+                format!("let MAX_DIM: u32 = {}u;", max_dim),
+            ),
+            (
+                "let MAX_DIM_QUARTER: u32 = \\d+u;",
+                format!("let MAX_DIM_QUARTER: u32 = {}u;", max_dim / 4),
+            ),
+        ];
+        for (pattern, replacement) in replacements.iter() {
+            shader_source = Regex::new(pattern)
+                .unwrap()
+                .replace_all(&shader_source, NoExpand(replacement))
+                .into_owned();
+        }
         let instance = Instance::new(Backends::PRIMARY);
         let adapter = instance
             .enumerate_adapters(Backends::PRIMARY)

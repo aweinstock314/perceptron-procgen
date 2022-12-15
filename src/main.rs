@@ -206,9 +206,12 @@ struct BackwardPass {
     weight_multiplicity: u64,
     output_weights: Buffer,
     output_weights_copy: Buffer,
+    dataset_points_bind_group_layout: BindGroupLayout,
+    dataset_labels_bind_group_layout: BindGroupLayout,
     backprop_bind_group_layout: BindGroupLayout,
 }
 
+#[derive(Clone)]
 struct Dataset {
     dimension: u32,
     count: u32,
@@ -306,7 +309,7 @@ impl GPUContext {
         let mut shader_source_file = BufReader::new(File::open("src/shaders.wgsl")?);
         shader_source_file.read_to_string(&mut shader_source)?;
         let mut max_dim = *dims.iter().max().unwrap();
-        max_dim += 4 - max_dim % 4;
+        max_dim += if max_dim % 4 != 0 { 4 - max_dim % 4 } else { 0 };
         let num_layers = dims.len();
         let replacements = [
             (
@@ -334,10 +337,11 @@ impl GPUContext {
             .next()
             .unwrap();
         println!("{:?}", adapter.get_info());
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default(), None)
-            .await?;
+        let mut device_descriptor = DeviceDescriptor::default();
+        device_descriptor.limits.max_bind_groups = 5;
+        let (device, queue) = adapter.request_device(&device_descriptor, None).await?;
         println!("{:?}", device);
+        println!("{:?}", device.limits());
         let shaders = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
             //source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
@@ -524,59 +528,81 @@ impl BackwardPass {
         weight_multiplicity: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let weights_offset = 2 * 4 + 4 * dims.len() as u64;
+        let dataset_points_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(12),
+                        },
+                        count: None,
+                    }],
+                });
+        let dataset_labels_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(12),
+                        },
+                        count: None,
+                    }],
+                });
         let backprop_bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&BindGroupLayoutDescriptor {
                     label: None,
-                    entries: &[
-                        BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::Buffer {
-                                ty: BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(weights_offset + 4),
-                            },
-                            count: None,
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: NonZeroU64::new(weights_offset + 4),
                         },
-                        BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::Buffer {
-                                ty: BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(12),
-                            },
-                            count: None,
-                        },
-                        BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: ShaderStages::COMPUTE,
-                            ty: BindingType::Buffer {
-                                ty: BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(12),
-                            },
-                            count: None,
-                        },
-                    ],
+                        count: None,
+                    }],
                 });
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[
-                    &ctx.matrices_bind_group_layout,
-                    &ctx.scalar_bind_group_layout,
-                    &backprop_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
+        let backprop_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[
+                        &ctx.matrices_bind_group_layout,
+                        &ctx.scalar_bind_group_layout,
+                        &dataset_points_bind_group_layout,
+                        &dataset_labels_bind_group_layout,
+                        &backprop_bind_group_layout,
+                    ],
+                    push_constant_ranges: &[],
+                });
+        let forward_pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[
+                        &ctx.matrices_bind_group_layout,
+                        &ctx.scalar_bind_group_layout,
+                        &dataset_points_bind_group_layout,
+                        &dataset_labels_bind_group_layout,
+                    ],
+                    push_constant_ranges: &[],
+                });
         let forward_pipeline = ctx
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
                 label: None,
-                layout: Some(&pipeline_layout),
+                layout: Some(&forward_pipeline_layout),
                 module: &ctx.shaders,
                 entry_point: &"forward_gpu",
             });
@@ -584,7 +610,7 @@ impl BackwardPass {
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
                 label: None,
-                layout: Some(&pipeline_layout),
+                layout: Some(&backprop_pipeline_layout),
                 module: &ctx.shaders,
                 entry_point: &"backprop_gpu",
             });
@@ -592,7 +618,7 @@ impl BackwardPass {
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
                 label: None,
-                layout: Some(&pipeline_layout),
+                layout: Some(&backprop_pipeline_layout),
                 module: &ctx.shaders,
                 entry_point: &"sum_weights",
             });
@@ -600,7 +626,7 @@ impl BackwardPass {
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
                 label: None,
-                layout: Some(&pipeline_layout),
+                layout: Some(&backprop_pipeline_layout),
                 module: &ctx.shaders,
                 entry_point: &"calc_norms",
             });
@@ -638,38 +664,56 @@ impl BackwardPass {
             weight_multiplicity,
             output_weights,
             output_weights_copy,
+            dataset_points_bind_group_layout,
+            dataset_labels_bind_group_layout,
             backprop_bind_group_layout,
         })
+    }
+    fn dataset_points_bind_group(
+        &self,
+        ctx: &GPUContext,
+        target_points: &mut Dataset,
+    ) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
+        let target_points = target_points.to_buffer(&ctx.device);
+        let dataset_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.dataset_points_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(target_points.as_entire_buffer_binding()),
+            }],
+        });
+        Ok((target_points, dataset_bind_group))
+    }
+    fn dataset_labels_bind_group(
+        &self,
+        ctx: &GPUContext,
+        target_labels: &mut Dataset,
+    ) -> Result<(Buffer, BindGroup), Box<dyn std::error::Error>> {
+        let target_labels = target_labels.to_buffer(&ctx.device);
+        let dataset_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.dataset_labels_bind_group_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(target_labels.as_entire_buffer_binding()),
+            }],
+        });
+        Ok((target_labels, dataset_bind_group))
     }
     fn backprop_bind_group(
         &self,
         ctx: &GPUContext,
-        target_points: &mut Dataset,
-        target_labels: &mut Dataset,
-    ) -> Result<((Buffer, Buffer), BindGroup), Box<dyn std::error::Error>> {
-        let target_points = target_points.to_buffer(&ctx.device);
-        let target_labels = target_labels.to_buffer(&ctx.device);
+    ) -> Result<BindGroup, Box<dyn std::error::Error>> {
         let backprop_bind_group = ctx.device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout: &self.backprop_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::Buffer(
-                        self.output_weights.as_entire_buffer_binding(),
-                    ),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::Buffer(target_points.as_entire_buffer_binding()),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Buffer(target_labels.as_entire_buffer_binding()),
-                },
-            ],
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(self.output_weights.as_entire_buffer_binding()),
+            }],
         });
-        Ok(((target_points, target_labels), backprop_bind_group))
+        Ok(backprop_bind_group)
     }
 }
 
@@ -752,6 +796,80 @@ fn sample_gpu(
     Ok(images)
 }
 
+fn forward_gpu(
+    ctx: &GPUContext,
+    pass: &BackwardPass,
+    dims: &[usize],
+    weights: &[DMatrix<f64>],
+    num_points: usize,
+    dataset_points_bind_group: &BindGroup,
+    label_buffer: &Buffer,
+    target_labels_bind_group: &BindGroup,
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let output_dim = dims[dims.len() - 1];
+    let output_size = (4 * output_dim * num_points) as u64;
+    let (_, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
+    let label_buffer_copy = ctx.device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: output_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let (_, scalar_bind_group) = ctx.scalar_bind_group(0.0, 0.0)?;
+    /*let mut target_labels = Dataset::new(output_dim as u32);
+    let blank_point = vec![0.0; output_dim];
+    for _ in 0..num_points {
+        target_labels.push(&blank_point);
+    }
+    let (label_buffer, dataset_labels_bind_group) =
+        pass.dataset_labels_bind_group(&ctx, &mut target_labels)?;*/
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
+        compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
+        compute_pass.set_bind_group(2, &dataset_points_bind_group, &[]);
+        compute_pass.set_bind_group(3, &target_labels_bind_group, &[]);
+        compute_pass.set_pipeline(&pass.forward_pipeline);
+        compute_pass.dispatch_workgroups(num_points as u32 / 16, 1, 1);
+        drop(compute_pass);
+        encoder.copy_buffer_to_buffer(&label_buffer, 8, &label_buffer_copy, 0, output_size);
+    }
+    let submission = ctx.queue.submit([encoder.finish()]);
+    let (result_tx, result_rx) = mpsc::channel();
+    label_buffer_copy
+        .slice(..)
+        .map_async(MapMode::Read, move |_| {
+            let _ = result_tx.send(());
+        });
+    while !ctx
+        .device
+        .poll(Maintain::WaitForSubmissionIndex(submission))
+    {}
+    let mut result = Vec::new();
+    while let Ok(()) = result_rx.recv() {
+        let result_bytes = Vec::from_iter(
+            label_buffer_copy
+                .slice(..)
+                .get_mapped_range()
+                .iter()
+                .copied(),
+        );
+        label_buffer_copy.unmap();
+        let mut cursor = std::io::Cursor::new(result_bytes);
+        for _ in 0..num_points {
+            let mut label = Vec::new();
+            for _ in 0..output_dim {
+                label.push(f32::from_bits(cursor.read_u32::<LittleEndian>()?));
+            }
+            result.push(label);
+        }
+    }
+    Ok(result)
+}
+
 fn sample_gpu_compute(
     ctx: &GPUContext,
     pass: &BackwardPass,
@@ -773,8 +891,10 @@ fn sample_gpu_compute(
         let t = 10.0 * ti as f32 / FRAMES_UNIT as f32;
         let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, 0.0)?;
         let (mut target_points, mut target_labels) = Dataset::blank_for_inference(t, width, height);
-        let ((_, label_buffer), backprop_bind_group) =
-            pass.backprop_bind_group(&ctx, &mut target_points, &mut target_labels)?;
+        let (_, dataset_points_bind_group) =
+            pass.dataset_points_bind_group(&ctx, &mut target_points)?;
+        let (label_buffer, dataset_labels_bind_group) =
+            pass.dataset_labels_bind_group(&ctx, &mut target_labels)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor::default());
@@ -782,7 +902,8 @@ fn sample_gpu_compute(
             let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
             compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
             compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
-            compute_pass.set_bind_group(2, &backprop_bind_group, &[]);
+            compute_pass.set_bind_group(2, &dataset_points_bind_group, &[]);
+            compute_pass.set_bind_group(3, &dataset_labels_bind_group, &[]);
             compute_pass.set_pipeline(&pass.forward_pipeline);
             compute_pass.dispatch_workgroups((width * height) / 16, 1, 1);
             drop(compute_pass);
@@ -841,59 +962,71 @@ fn backprop_gpu(
     pass: &BackwardPass,
     dims: &[usize],
     weights: &mut [DMatrix<f64>],
-    dataset_size: u32,
     t: f32,
     alpha: f32,
     epochs: usize,
+    dataset_bind_groups: &[(u32, &BindGroup, &BindGroup)],
     backprop_bind_group: &BindGroup,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
     let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, alpha)?;
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&CommandEncoderDescriptor::default());
+    let mut submission = None;
+    for (i, (dataset_size, dataset_points_bind_group, dataset_labels_bind_group)) in
+        dataset_bind_groups.iter().enumerate()
     {
-        /*encoder.copy_buffer_to_buffer(
-            &matrices_buffer,
-            0,
-            &pass.output_weights,
-            0,
-            matrices_buffer.size(),
-        );*/
-        for _ in 0..epochs {
-            encoder.clear_buffer(
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            /*encoder.copy_buffer_to_buffer(
+                &matrices_buffer,
+                0,
                 &pass.output_weights,
-                pass.weights_offset,
-                NonZeroU64::new(pass.output_weights.size() - pass.weights_offset),
-            );
-            let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-            compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
-            compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
-            compute_pass.set_bind_group(2, backprop_bind_group, &[]);
-            compute_pass.set_pipeline(&pass.calc_norms_pipeline);
-            compute_pass.dispatch_workgroups(1, 1, 1);
-            compute_pass.set_pipeline(&pass.backprop_pipeline);
-            compute_pass.dispatch_workgroups(dataset_size / 16, 1, 1);
-            compute_pass.set_pipeline(&pass.sum_weights_pipeline);
-            compute_pass.dispatch_workgroups(1, 1, 1);
-            drop(compute_pass);
+                0,
+                matrices_buffer.size(),
+            );*/
+            for _ in 0..epochs {
+                encoder.clear_buffer(
+                    &pass.output_weights,
+                    pass.weights_offset,
+                    NonZeroU64::new(pass.output_weights.size() - pass.weights_offset),
+                );
+                let mut compute_pass =
+                    encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                compute_pass.set_bind_group(0, &matrices_bind_group, &[]);
+                compute_pass.set_bind_group(1, &scalar_bind_group, &[]);
+                compute_pass.set_bind_group(4, backprop_bind_group, &[]);
+                {
+                    compute_pass.set_bind_group(2, dataset_points_bind_group, &[]);
+                    compute_pass.set_bind_group(3, dataset_labels_bind_group, &[]);
+                    if i == 0 || true {
+                        compute_pass.set_pipeline(&pass.calc_norms_pipeline);
+                        compute_pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    compute_pass.set_pipeline(&pass.backprop_pipeline);
+                    compute_pass.dispatch_workgroups(dataset_size / 16, 1, 1);
+                }
+                compute_pass.set_pipeline(&pass.sum_weights_pipeline);
+                compute_pass.dispatch_workgroups(1, 1, 1);
+                drop(compute_pass);
+                encoder.copy_buffer_to_buffer(
+                    &pass.output_weights,
+                    pass.weights_offset,
+                    &matrices_buffer,
+                    4 * dims.len() as u64,
+                    4 * pass.num_weights as u64,
+                );
+            }
             encoder.copy_buffer_to_buffer(
                 &pass.output_weights,
                 pass.weights_offset,
-                &matrices_buffer,
-                4 * dims.len() as u64,
+                &pass.output_weights_copy,
+                0,
                 4 * pass.num_weights as u64,
             );
         }
-        encoder.copy_buffer_to_buffer(
-            &pass.output_weights,
-            pass.weights_offset,
-            &pass.output_weights_copy,
-            0,
-            4 * pass.num_weights as u64,
-        );
+        submission = Some(ctx.queue.submit([encoder.finish()]));
     }
-    let submission = ctx.queue.submit([encoder.finish()]);
     let (weights_tx, weights_rx) = mpsc::channel();
     pass.output_weights_copy
         .slice(..)
@@ -902,7 +1035,7 @@ fn backprop_gpu(
         });
     while !ctx
         .device
-        .poll(Maintain::WaitForSubmissionIndex(submission))
+        .poll(Maintain::WaitForSubmissionIndex(submission.unwrap()))
     {}
     while let Ok(()) = weights_rx.recv() {
         let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
@@ -944,29 +1077,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("[11, 10, 10, 3]")
                 .global(true),
         )
+        .arg(
+            Arg::new("epochs")
+                .short('e')
+                .value_parser(value_parser!(usize))
+                .default_value("4000")
+                .global(true),
+        )
+        .arg(
+            Arg::new("epochs_per_batch")
+                .long("epochs-per-batch")
+                .value_parser(value_parser!(usize))
+                .default_value("8")
+                .global(true),
+        )
+        .arg(
+            Arg::new("learning_rate")
+                .short('l')
+                .value_parser(value_parser!(f64))
+                .default_value("0.001")
+                .global(true),
+        )
         .subcommand(Command::new("forward"))
         .subcommand(
             Command::new("backward")
                 .arg(Arg::new("target_image").short('t').required(true))
-                .arg(Arg::new("weights").short('w'))
-                .arg(
-                    Arg::new("epochs_per_batch")
-                        .long("epochs-per-batch")
-                        .value_parser(value_parser!(usize))
-                        .default_value("8"),
-                )
-                .arg(
-                    Arg::new("epochs")
-                        .short('e')
-                        .value_parser(value_parser!(usize))
-                        .default_value("4000"),
-                )
-                .arg(
-                    Arg::new("learning_rate")
-                        .short('l')
-                        .value_parser(value_parser!(f64))
-                        .default_value("0.001"),
-                ),
+                .arg(Arg::new("weights").short('w')),
         )
         .subcommand(
             Command::new("infer_params").arg(Arg::new("target_image").short('t').required(true)),
@@ -993,6 +1129,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut dims =
         serde_json::from_str::<Vec<usize>>(&**matches.get_one::<String>("dimensions").unwrap())?;
+    let epochs = matches.get_one::<usize>("epochs").unwrap();
+    let epochs_per_batch = matches.get_one::<usize>("epochs_per_batch").unwrap();
+    let mut alpha = *matches.get_one::<f64>("learning_rate").unwrap();
 
     match matches.subcommand() {
         Some(("forward", _matches)) => {
@@ -1056,8 +1195,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some(("backward", matches)) => {
-            let epochs_per_batch = matches.get_one::<usize>("epochs_per_batch").unwrap();
-            let epochs = matches.get_one::<usize>("epochs").unwrap();
             let mut weights = if let Some(weights_json) = matches.get_one::<String>("weights") {
                 let data = serde_json::from_str::<Vec<Vec<f64>>>(&weights_json)?;
                 let mut weights = Vec::new();
@@ -1083,11 +1220,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bk_pass = BackwardPass::new(&ctx, &dims, 8)?;
             let (mut target_points, mut target_labels) =
                 Dataset::from_image_pixels(0.0, &target_image);
-            let (_, backprop_bind_group) =
-                bk_pass.backprop_bind_group(&ctx, &mut target_points, &mut target_labels)?;
+            let (_, dataset_points_bind_group) =
+                bk_pass.dataset_points_bind_group(&ctx, &mut target_points)?;
+            let (_, dataset_labels_bind_group) =
+                bk_pass.dataset_labels_bind_group(&ctx, &mut target_labels)?;
+            let backprop_bind_group = bk_pass.backprop_bind_group(&ctx)?;
             std::fs::create_dir_all("backprop_imgs")?;
             std::fs::create_dir_all("weights")?;
-            let mut alpha = *matches.get_one::<f64>("learning_rate").unwrap();
             let mut prev_error = std::f32::INFINITY;
             for i in 0..epochs / epochs_per_batch {
                 let pre = Instant::now();
@@ -1110,11 +1249,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &bk_pass,
                             &dims,
                             &mut weights,
-                            target_points.count,
                             0.0,
                             (alpha / ((target_image.width() * target_image.height()) as f64).sqrt())
                                 as f32,
                             *epochs_per_batch,
+                            &[(
+                                target_points.count,
+                                &dataset_points_bind_group,
+                                &dataset_labels_bind_group,
+                            )],
                             &backprop_bind_group,
                         )?;
                     }
@@ -1215,8 +1358,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (mut target_points, mut target_labels) =
                     Dataset::from_image_pixels(0.0, &target_image);
                 let bk_pass = BackwardPass::new(&ctx, &dims, *weight_multiplicity)?;
-                let (_, backprop_bind_group) =
-                    bk_pass.backprop_bind_group(&ctx, &mut target_points, &mut target_labels)?;
+                let (_, dataset_points_bind_group) =
+                    bk_pass.dataset_points_bind_group(&ctx, &mut target_points)?;
+                let (_, dataset_labels_bind_group) =
+                    bk_pass.dataset_labels_bind_group(&ctx, &mut target_labels)?;
+                let backprop_bind_group = bk_pass.backprop_bind_group(&ctx)?;
                 let mut weights = weights.clone();
                 let pre = Instant::now();
                 backprop_gpu(
@@ -1224,10 +1370,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &bk_pass,
                     &dims,
                     &mut weights,
-                    target_points.count,
                     0.0,
                     0.001,
                     *epochs_per_batch,
+                    &[(
+                        target_points.count,
+                        &dataset_points_bind_group,
+                        &dataset_labels_bind_group,
+                    )],
                     &backprop_bind_group,
                 )?;
                 let post = Instant::now();
@@ -1253,34 +1403,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let save_images =
                 matches.get_one::<String>("save_images").map(|x| &**x) == Some("true");
             let magic = labels_file.read_u32::<BigEndian>()?;
-            let num_labels = labels_file.read_u32::<BigEndian>()?;
+            let num_labels = labels_file.read_u32::<BigEndian>()? as usize;
             assert_eq!(magic, 0x00000801, "MNIST labels magic mismatch");
             let magic = images_file.read_u32::<BigEndian>()?;
             assert_eq!(magic, 0x00000803, "MNIST images magic mismatch");
-            let num_images = images_file.read_u32::<BigEndian>()?;
+            let num_images = images_file.read_u32::<BigEndian>()? as usize;
             assert_eq!(
                 num_labels, num_images,
                 "Inconsistant amount of training points between label and image files."
             );
-            const NUM_POINTS: u32 = 1;
-            let mut target_labels = Dataset::new(10);
+            let width = images_file.read_u32::<BigEndian>()?;
+            let height = images_file.read_u32::<BigEndian>()?;
+            const BATCH_SIZE_CAP: usize = 160;
+            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
+            let mut batch_size = (ctx.device.limits().max_storage_buffer_binding_size as usize - 8)
+                / (4 * width as usize * height as usize);
+            batch_size = batch_size.min(BATCH_SIZE_CAP);
+            batch_size += if batch_size % 16 != 0 {
+                16 - batch_size % 16
+            } else {
+                0
+            };
+            let num_batches =
+                (num_images / batch_size) + if (num_images % batch_size) != 0 { 1 } else { 0 };
+            assert_eq!(num_batches * batch_size, num_images);
+            let mut target_labels = vec![Dataset::new(10); num_batches];
             let mut labels: BTreeMap<u32, u8> = BTreeMap::new();
-            for i in 0..num_labels.min(NUM_POINTS) {
+            for i in 0..num_labels {
                 let value = labels_file.read_u8()?;
-                labels.insert(i, value);
-                let mut point = [0.0; 10];
+                labels.insert(i as u32, value);
+                let mut point = [-1.0; 10];
                 point[value as usize % 10] = 1.0;
-                target_labels.push(&point);
+                target_labels[i % num_batches].push(&point);
             }
             let mut labels_json = File::create("mnist_labels.json")?;
             write!(labels_json, "{}", serde_json::to_string(&labels)?)?;
-            let width = images_file.read_u32::<BigEndian>()?;
-            let height = images_file.read_u32::<BigEndian>()?;
             if save_images {
                 std::fs::create_dir_all("mnist_imgs")?;
             }
-            let mut target_points = Dataset::new(width * height);
-            for i in 0..num_images.min(NUM_POINTS) {
+            let mut target_points = vec![Dataset::new(width * height); num_batches];
+            for i in 0..num_images {
                 let mut bytes = Vec::new();
                 let mut point = Vec::new();
                 for _ in 0..width * height {
@@ -1293,7 +1455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ImageBuffer::<Luma<u8>, Vec<u8>>::from_raw(width, height, bytes).unwrap();
                     image.save(format!("mnist_imgs/{:05}.png", i))?;
                 }
-                target_points.push(&point);
+                target_points[i % num_batches].push(&point);
             }
             dims[0] = width as usize * height as usize;
             let dims_len = dims.len();
@@ -1311,25 +1473,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 gen_weights(0, &dims)
             };
-            let ctx = futures_executor::block_on(GPUContext::new(&dims))?;
             let bk_pass = BackwardPass::new(&ctx, &dims, 8)?;
-            let (_, backprop_bind_group) =
-                bk_pass.backprop_bind_group(&ctx, &mut target_points, &mut target_labels)?;
-            let pre = Instant::now();
-            backprop_gpu(
-                &ctx,
-                &bk_pass,
-                &dims,
-                &mut weights,
-                target_points.count,
-                0.0,
-                0.001,
-                1,
-                &backprop_bind_group,
-            )?;
-            let post = Instant::now();
-            let duration = post.duration_since(pre);
-            println!("backprop pass {}: {} seconds", 0, duration.as_secs_f32(),);
+            let mut dataset_bind_groups = Vec::new();
+            for j in 0..num_batches {
+                let (_, dataset_points_bind_group) =
+                    bk_pass.dataset_points_bind_group(&ctx, &mut target_points[j])?;
+                let (_, dataset_labels_bind_group) =
+                    bk_pass.dataset_labels_bind_group(&ctx, &mut target_labels[j])?;
+                dataset_bind_groups.push((
+                    target_points[j].count,
+                    dataset_points_bind_group,
+                    dataset_labels_bind_group,
+                ));
+            }
+            let (output_labels_buffer, output_labels_bind_group) =
+                bk_pass.dataset_labels_bind_group(&ctx, &mut target_labels[0])?;
+            let dataset_bind_group_refs = dataset_bind_groups
+                .iter()
+                .map(|(i, x, y)| (*i, x, y))
+                .collect::<Vec<_>>();
+            let backprop_bind_group = bk_pass.backprop_bind_group(&ctx)?;
+            std::fs::create_dir_all("mnist_weights")?;
+            for i in 0..*epochs / *epochs_per_batch {
+                for j in 0..num_batches {
+                    let pre = Instant::now();
+                    backprop_gpu(
+                        &ctx,
+                        &bk_pass,
+                        &dims,
+                        &mut weights,
+                        0.0,
+                        alpha as f32,
+                        *epochs_per_batch,
+                        &[dataset_bind_group_refs[j]],
+                        &backprop_bind_group,
+                    )?;
+                    let post = Instant::now();
+                    let duration = post.duration_since(pre);
+                    println!(
+                        "backprop pass {}, {}: {} seconds",
+                        i,
+                        j,
+                        duration.as_secs_f32()
+                    );
+                }
+                if let Ok(mut f) = File::create(format!("mnist_weights/checkpoint_{:05}.json", i)) {
+                    let serialized_weights = serde_json::to_string(
+                        &weights
+                            .iter()
+                            .map(|w| w.data.as_vec().clone())
+                            .collect::<Vec<Vec<f64>>>(),
+                    )?;
+                    writeln!(f, "{}", serialized_weights)?;
+                }
+                let mut error = 0.0;
+                let mut batch_offset = 0;
+                let mut f = File::create(format!("mnist_output_{:05}.json", i))?;
+                for j in 0..num_batches {
+                    let pre = Instant::now();
+                    let generated_labels = forward_gpu(
+                        &ctx,
+                        &bk_pass,
+                        &dims,
+                        &weights,
+                        dataset_bind_groups[j].0 as usize,
+                        &dataset_bind_groups[j].1,
+                        &output_labels_buffer,
+                        &output_labels_bind_group,
+                    )?;
+                    let post = Instant::now();
+                    let duration = post.duration_since(pre);
+                    println!(
+                        "forward pass {}, {}: {} points, {} seconds",
+                        i,
+                        j,
+                        target_points[j].count,
+                        duration.as_secs_f32()
+                    );
+                    for (k, generated_label) in generated_labels.iter().enumerate() {
+                        writeln!(f, "{}: {:?}", batch_offset + k, generated_label)?;
+                        let mut target_label = [-1.0; 10];
+                        target_label[labels[&((batch_offset + k) as u32)] as usize % 10] = 1.0f32;
+                        let target_label =
+                            DMatrix::from_iterator(1, 10, target_label.iter().copied());
+                        let generated_label =
+                            DMatrix::from_iterator(1, 10, generated_label.iter().copied());
+                        error += (generated_label - &target_label).norm_squared();
+                    }
+                    batch_offset += generated_labels.len();
+                }
+                println!("error {}: {}", i, error);
+            }
         }
         _ => {
             println!("{}", command_help);

@@ -37,6 +37,7 @@ struct Dataset {
 @group(3) @binding(0) var<storage, read_write> target_labels: Dataset;
 
 @group(4) @binding(0) var<storage, read_write> write_matrices: MatrixDeltas;
+@group(4) @binding(1) var<storage, read_write> output_weights_sum: array<f32>;
 
 //var<workgroup> foo: atomic<u32> = atomic<u32>(0u);
 //var<workgroup> foo: u32 = 0u;
@@ -186,7 +187,7 @@ fn calc_norms() {
     }
 }
 
-@compute @workgroup_size(16)
+@compute @workgroup_size(250)
 fn forward_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     var fw: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     let dataset_index = global_invocation_id.x;
@@ -209,13 +210,13 @@ fn forward_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     }
 }
 
-@compute @workgroup_size(16)
+@compute @workgroup_size(24)
 fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     let alpha = scalars.alpha;
     let lambda = 0.001;
     //let position = IMAGE_SCALE * ((vec3<f32>(global_invocation_id) / vec3<f32>(f32(scalars.image_width), f32(scalars.image_height), 1.0)) - 0.5);
     //let multiplicity_offset = ((3u * global_invocation_id.x + 5u * global_invocation_id.y) % write_matrices.count) * write_matrices.stride;
-    let multiplicity_offset = ((3u * global_invocation_id.x) % write_matrices.count) * write_matrices.stride;
+    let multiplicity_offset = ((65537u * global_invocation_id.x) % write_matrices.count) * write_matrices.stride;
     //let u = position.x;
     //let v = position.y;
     var fw: array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS> = array<array<vec4<f32>, MAX_DIM_QUARTER>, NUM_LAYERS>();
@@ -301,7 +302,7 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) 
 }
 
 @compute @workgroup_size(1)
-fn sum_weights() {
+fn sum_delta_weights() {
     for(var k = 1u; k < write_matrices.count; k++) {
         for(var i = 0u; i < write_matrices.stride; i++) {
             let x = atomicLoad(&write_matrices.weights[k * write_matrices.stride + i]);
@@ -309,9 +310,13 @@ fn sum_weights() {
             atomicStore(&write_matrices.weights[i], bitcast<u32>(bitcast<f32>(x) + bitcast<f32>(y)));
         }
     }
+}
+
+@compute @workgroup_size(1)
+fn sum_weights() {
     for(var i = 0u; i < write_matrices.stride; i++) {
         let x = atomicLoad(&matrices.weights[i]);
         let y = atomicLoad(&write_matrices.weights[i]);
-        atomicStore(&write_matrices.weights[i], bitcast<u32>(bitcast<f32>(x) + bitcast<f32>(y)));
+        output_weights_sum[i] = bitcast<f32>(x) + bitcast<f32>(y);
     }
 }

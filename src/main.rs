@@ -181,6 +181,7 @@ struct GPUContext {
     device: Device,
     queue: Queue,
     shaders: ShaderModule,
+    shaders_parsed: naga::Module,
     matrices_bind_group_layout: BindGroupLayout,
     scalar_bind_group_layout: BindGroupLayout,
 }
@@ -200,6 +201,8 @@ struct BackwardPass {
     backprop_pipeline: ComputePipeline,
     sum_weights_pipeline: ComputePipeline,
     forward_pipeline: ComputePipeline,
+    forward_workgroup_size: u32,
+    backprop_workgroup_size: u32,
     num_weights: usize,
     weights_offset: u64,
     weights_size: u64,
@@ -342,6 +345,7 @@ impl GPUContext {
         let (device, queue) = adapter.request_device(&device_descriptor, None).await?;
         println!("{:?}", device);
         println!("{:?}", device.limits());
+        let shaders_parsed = naga::front::wgsl::Parser::new().parse(&shader_source)?;
         let shaders = device.create_shader_module(ShaderModuleDescriptor {
             label: None,
             //source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders.wgsl"))),
@@ -381,6 +385,7 @@ impl GPUContext {
             device,
             queue,
             shaders,
+            shaders_parsed,
             matrices_bind_group_layout,
             scalar_bind_group_layout,
         })
@@ -438,6 +443,13 @@ impl GPUContext {
             }],
         });
         Ok((scalar_buffer, scalar_bind_group))
+    }
+    fn workgroup_size_for_entry_point(&self, name: &str) -> Option<[u32; 3]> {
+        self.shaders_parsed
+            .entry_points
+            .iter()
+            .find(|ep| &ep.name == name)
+            .map(|ep| ep.workgroup_size)
     }
 }
 
@@ -606,6 +618,7 @@ impl BackwardPass {
                 module: &ctx.shaders,
                 entry_point: &"forward_gpu",
             });
+        let forward_workgroup_size = ctx.workgroup_size_for_entry_point("forward_gpu").unwrap()[0];
         let backprop_pipeline = ctx
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
@@ -614,6 +627,8 @@ impl BackwardPass {
                 module: &ctx.shaders,
                 entry_point: &"backprop_gpu",
             });
+        let backprop_workgroup_size =
+            ctx.workgroup_size_for_entry_point("backprop_gpu").unwrap()[0];
         let sum_weights_pipeline = ctx
             .device
             .create_compute_pipeline(&ComputePipelineDescriptor {
@@ -659,6 +674,8 @@ impl BackwardPass {
             sum_weights_pipeline,
             forward_pipeline,
             num_weights,
+            forward_workgroup_size,
+            backprop_workgroup_size,
             weights_offset,
             weights_size,
             weight_multiplicity,
@@ -833,7 +850,11 @@ fn forward_gpu(
         compute_pass.set_bind_group(2, &dataset_points_bind_group, &[]);
         compute_pass.set_bind_group(3, &target_labels_bind_group, &[]);
         compute_pass.set_pipeline(&pass.forward_pipeline);
-        compute_pass.dispatch_workgroups(num_points as u32 / 16, 1, 1);
+        let mut num_workgroups = num_points as u32 / pass.forward_workgroup_size;
+        if num_points as u32 % pass.forward_workgroup_size != 0 {
+            num_workgroups += 1;
+        }
+        compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
         drop(compute_pass);
         encoder.copy_buffer_to_buffer(&label_buffer, 8, &label_buffer_copy, 0, output_size);
     }
@@ -905,7 +926,7 @@ fn sample_gpu_compute(
             compute_pass.set_bind_group(2, &dataset_points_bind_group, &[]);
             compute_pass.set_bind_group(3, &dataset_labels_bind_group, &[]);
             compute_pass.set_pipeline(&pass.forward_pipeline);
-            compute_pass.dispatch_workgroups((width * height) / 16, 1, 1);
+            compute_pass.dispatch_workgroups((width * height) / pass.forward_workgroup_size, 1, 1);
             drop(compute_pass);
             encoder.copy_buffer_to_buffer(
                 &label_buffer,
@@ -971,6 +992,7 @@ fn backprop_gpu(
     let (matrices_buffer, matrices_bind_group) = ctx.matrices_bind_group(dims, weights)?;
     let (scalar_buffer, scalar_bind_group) = ctx.scalar_bind_group(t, alpha)?;
     let mut submission = None;
+    ctx.device.start_capture();
     for (i, (dataset_size, dataset_points_bind_group, dataset_labels_bind_group)) in
         dataset_bind_groups.iter().enumerate()
     {
@@ -1004,7 +1026,11 @@ fn backprop_gpu(
                         compute_pass.dispatch_workgroups(1, 1, 1);
                     }
                     compute_pass.set_pipeline(&pass.backprop_pipeline);
-                    compute_pass.dispatch_workgroups(dataset_size / 16, 1, 1);
+                    let mut num_workgroups = dataset_size / pass.backprop_workgroup_size;
+                    if dataset_size % pass.backprop_workgroup_size != 0 {
+                        num_workgroups += 1;
+                    }
+                    compute_pass.dispatch_workgroups(num_workgroups, 1, 1);
                 }
                 compute_pass.set_pipeline(&pass.sum_weights_pipeline);
                 compute_pass.dispatch_workgroups(1, 1, 1);
@@ -1037,6 +1063,7 @@ fn backprop_gpu(
         .device
         .poll(Maintain::WaitForSubmissionIndex(submission.unwrap()))
     {}
+    ctx.device.stop_capture();
     while let Ok(()) = weights_rx.recv() {
         let weights_slice = pass.output_weights_copy.slice(..).get_mapped_range();
         let mut cursor = std::io::Cursor::new(weights_slice);

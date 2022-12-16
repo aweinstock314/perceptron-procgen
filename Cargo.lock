@@ -885,6 +885,7 @@ dependencies = [
  "clap",
  "futures-executor",
  "image",
+ "naga",
  "nalgebra",
  "rand",
  "regex",

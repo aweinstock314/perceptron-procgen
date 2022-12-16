@@ -190,6 +190,9 @@ fn calc_norms() {
 fn forward_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     var fw: array<vec4<f32>, MAX_DIM_QUARTER> = array<vec4<f32>, MAX_DIM_QUARTER>();
     let dataset_index = global_invocation_id.x;
+    if dataset_index >= target_points.count {
+        return;
+    }
     for(var i = 0u; i < target_points.dimension; i++) {
         fw[i/4u][i%4u] = target_points.data[dataset_index * target_points.dimension + i];
     }
@@ -222,6 +225,9 @@ fn backprop_gpu(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) 
     //fw[0][1] = vec4(u*u, u*v, v*v, u*u*u);
     //fw[0][2] = vec4(u*u*v, u*v*v, v*v*v, 0.0);
     let dataset_index = global_invocation_id.x;
+    if dataset_index >= target_points.count {
+        return;
+    }
     for(var i = 0u; i < target_points.dimension; i++) {
         fw[0][i/4u][i%4u] = target_points.data[dataset_index * target_points.dimension + i];
     }
